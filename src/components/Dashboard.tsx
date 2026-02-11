@@ -4,9 +4,14 @@ import ControlPanel from './ControlPanel'
 import StatsPanel from './StatsPanel'
 import AccountPanel from './AccountPanel'
 import ConfigPanel from './ConfigPanel'
+import WalletManagement from './WalletManagement'
 import './Dashboard.css'
 
-const Dashboard: React.FC = () => {
+interface DashboardProps {
+  onShowWalletManagement?: () => void
+}
+
+const Dashboard: React.FC<DashboardProps> = ({ onShowWalletManagement }) => {
   const { status, loading } = useStatus()
 
   if (loading || !status) {
@@ -39,12 +44,24 @@ const Dashboard: React.FC = () => {
               : 'Ready to start'
             }
           </span>
+          {onShowWalletManagement && (
+            <button 
+              className="btn-manage-wallets"
+              onClick={onShowWalletManagement}
+              title="Manage wallets"
+            >
+              🔐 Manage Wallets
+            </button>
+          )}
         </div>
       </div>
 
       <div className="dashboard-grid">
         <div className="dashboard-card account-card">
-          <AccountPanel account={status.account} />
+          <AccountPanel 
+            account={status.account} 
+            onManageWallets={onShowWalletManagement}
+          />
         </div>
         
         <div className="dashboard-card control-card">
