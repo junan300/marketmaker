@@ -126,6 +126,31 @@ const WalletManagement: React.FC<WalletManagementProps> = ({ onBack, onWalletSel
     }
   }
 
+  const deleteWallet = async (address: string) => {
+    if (!window.confirm(`Remove wallet ${address.slice(0, 8)}...? The key will be deleted from this app. Export the key first if you need a backup.`)) return
+    try {
+      await axios.post(`/api/v2/wallets/${encodeURIComponent(address)}/delete`)
+      await loadWallets()
+      await loadActiveWallets()
+      setError(null)
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to remove wallet')
+    }
+  }
+
+  const resetAllWallets = async () => {
+    if (!window.confirm('Remove ALL wallets and start from a blank slate? Take-profit targets will be cleared. This cannot be undone.')) return
+    try {
+      await axios.post('/api/v2/wallets/reset-all')
+      await loadWallets()
+      await loadActiveWallets()
+      onWalletSelected()
+      setError(null)
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to reset wallets')
+    }
+  }
+
   const formatAddress = (address: string) => {
     return `${address.slice(0, 8)}...${address.slice(-8)}`
   }
@@ -159,6 +184,15 @@ const WalletManagement: React.FC<WalletManagementProps> = ({ onBack, onWalletSel
           >
             {refreshing ? 'Refreshing...' : '🔄 Refresh Balances'}
           </button>
+          {wallets.length > 0 && (
+            <button
+              className="btn btn-danger"
+              onClick={resetAllWallets}
+              title="Remove all wallets and start from scratch"
+            >
+              🗑️ Reset All Wallets
+            </button>
+          )}
         </div>
       </div>
 
@@ -276,6 +310,13 @@ const WalletManagement: React.FC<WalletManagementProps> = ({ onBack, onWalletSel
                       title={activeWallets.includes(wallet.address) ? 'Remove from active wallets' : 'Add to active wallets'}
                     >
                       {activeWallets.includes(wallet.address) ? '⭐ Active' : '☆ Set Active'}
+                    </button>
+                    <button
+                      className="btn-remove"
+                      onClick={() => deleteWallet(wallet.address)}
+                      title="Remove wallet (delete key from app)"
+                    >
+                      🗑️ Remove
                     </button>
                   </div>
                   <small className="full-address">{wallet.address}</small>

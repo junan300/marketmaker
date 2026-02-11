@@ -17,10 +17,10 @@ from typing import Optional
 
 logger = logging.getLogger("dex.jupiter")
 
-# Jupiter API endpoints
-JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
-JUPITER_PRICE_URL = "https://price.jup.ag/v6/price"
+# Jupiter API endpoints (migrated from deprecated v6 to current lite-api)
+JUPITER_QUOTE_URL = "https://lite-api.jup.ag/swap/v1/quote"
+JUPITER_SWAP_URL = "https://lite-api.jup.ag/swap/v1/swap"
+JUPITER_PRICE_URL = "https://lite-api.jup.ag/price/v2"
 
 # SOL mint address (native)
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -107,7 +107,12 @@ class JupiterAdapter:
     # ── Price Queries ───────────────────────────────────────────────
 
     async def get_price(self, token_mint: str) -> Optional[float]:
-        """Get current token price in USD from Jupiter."""
+        """Get current token price in USD from Jupiter.
+
+        Tries the price API first, falls back to deriving price from a
+        small quote (the v2 price API may require authentication).
+        """
+        # Try the price API first
         await self._rate_limiter.acquire()
         client = await self._get_client()
 
@@ -116,16 +121,32 @@ class JupiterAdapter:
                 JUPITER_PRICE_URL,
                 params={"ids": token_mint},
             )
-            response.raise_for_status()
-            data = response.json()
-
-            if "data" in data and token_mint in data["data"]:
-                return data["data"][token_mint]["price"]
-            return None
-
+            if response.status_code == 200:
+                data = response.json()
+                if "data" in data and token_mint in data["data"]:
+                    return data["data"][token_mint]["price"]
         except Exception as e:
-            logger.error(f"Failed to get price for {token_mint[:8]}...: {e}")
-            return None
+            logger.debug(f"Price API unavailable for {token_mint[:8]}...: {e}")
+
+        # Fallback: derive price from a small quote (1 SOL -> token)
+        try:
+            quote = await self.get_quote(
+                input_mint=SOL_MINT,
+                output_mint=token_mint,
+                amount=1_000_000_000,  # 1 SOL in lamports
+            )
+            if quote and quote.raw_quote.get("swapUsdValue"):
+                # swapUsdValue is the USD value of the input (1 SOL)
+                sol_usd = float(quote.raw_quote["swapUsdValue"])
+                # Price per token = SOL_USD_price / tokens_per_SOL
+                tokens_per_sol = quote.output_amount / (10 ** 6)  # assuming 6 decimals
+                if tokens_per_sol > 0:
+                    price_usd = sol_usd / tokens_per_sol
+                    return price_usd
+        except Exception as e:
+            logger.error(f"Failed to derive price for {token_mint[:8]}...: {e}")
+
+        return None
 
     async def get_price_in_sol(self, token_mint: str, amount_lamports: int = 1_000_000_000) -> Optional[float]:
         """Get how many tokens you get per SOL using a quote."""

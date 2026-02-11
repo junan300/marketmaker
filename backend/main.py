@@ -347,6 +347,17 @@ async def list_wallets():
     return wallet_orchestrator.get_pool_status()
 
 
+@app.post("/api/v2/wallets/reset")
+@app.post("/api/v2/wallets/reset-all")
+async def reset_all_wallets():
+    """Remove all wallets and take-profit targets — start from a blank slate."""
+    if not wallet_orchestrator:
+        raise HTTPException(500, "Wallet orchestrator not initialized")
+    count = wallet_orchestrator.clear_all()
+    take_profit_targets.clear()
+    return {"status": "reset", "wallets_removed": count}
+
+
 @app.post("/api/v2/wallets/{address}/disable")
 async def disable_wallet(address: str):
     if wallet_orchestrator:
@@ -359,6 +370,20 @@ async def enable_wallet(address: str):
     if wallet_orchestrator:
         wallet_orchestrator.enable_wallet(address)
     return {"status": "enabled"}
+
+
+@app.delete("/api/v2/wallets/{address}")
+@app.post("/api/v2/wallets/{address}/delete")
+async def delete_wallet(address: str):
+    """Remove a single wallet from the pool and encrypted keystore."""
+    if not wallet_orchestrator:
+        raise HTTPException(500, "Wallet orchestrator not initialized")
+    removed = wallet_orchestrator.remove_wallet(address)
+    if not removed:
+        raise HTTPException(404, f"Wallet {address} not found")
+    if address in take_profit_targets:
+        del take_profit_targets[address]
+    return {"status": "deleted", "address": address}
 
 
 @app.post("/api/v2/wallets/active")

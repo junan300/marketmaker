@@ -253,6 +253,9 @@
 
 .wallet-footer-actions {
   margin-bottom: 8px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .btn-active {
@@ -278,6 +281,21 @@
 
 .btn-active.active:hover {
   background: #45a049;
+}
+
+.btn-remove {
+  background: transparent;
+  color: #c62828;
+  border: 1px solid #c62828;
+  border-radius: 4px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: all 0.2s;
+}
+
+.btn-remove:hover {
+  background: #ffebee;
 }
 
 .full-address {
@@ -346,6 +364,15 @@
 
 .btn-secondary:hover:not(:disabled) {
   background: #1976d2;
+}
+
+.btn-danger {
+  background: #c62828;
+  color: white;
+}
+
+.btn-danger:hover {
+  background: #b71c1c;
 }
 
 .btn:disabled {

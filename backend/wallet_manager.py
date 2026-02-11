@@ -232,6 +232,15 @@ class EncryptedKeyStore:
             return True
         return False
 
+    def clear_all(self) -> int:
+        """Remove all keys from the keystore. Returns number of wallets removed."""
+        store = self._load_store()
+        count = len(store)
+        if count:
+            self._save_store({})
+            logger.info(f"Keystore cleared: {count} wallet(s) removed")
+        return count
+
     def _load_store(self) -> dict:
         if not self._store_path.exists():
             return {}
@@ -466,6 +475,29 @@ class WalletOrchestrator:
         with self._lock:
             self._active_wallets.discard(address)
             logger.info(f"Wallet {address[:8]}... removed from active set")
+
+    def remove_wallet(self, address: str) -> bool:
+        """Remove a wallet from the pool and from the encrypted keystore. Returns True if removed."""
+        with self._lock:
+            self._active_wallets.discard(address)
+            if address in self._wallets:
+                del self._wallets[address]
+                removed = self.keystore.remove_key(address)
+                if removed:
+                    logger.info(f"Wallet removed from pool: {address[:8]}...")
+                return removed
+            return self.keystore.remove_key(address)
+
+    def clear_all(self) -> int:
+        """Remove all wallets from the pool and keystore. Returns number of wallets removed."""
+        with self._lock:
+            addresses = list(self._wallets.keys())
+            self._wallets.clear()
+            self._active_wallets.clear()
+            self._round_robin_index = 0
+        count = self.keystore.clear_all()
+        logger.info("Wallet pool reset to blank slate")
+        return count
 
     def get_active_wallets(self) -> list[str]:
         """Get list of active wallet addresses."""
