@@ -626,36 +626,41 @@ async def refresh_wallet_balance():
     }
 
 
-@app.get("/api/wallet/export/{address}")
-async def export_wallet_key(address: str, passphrase: str = None):
+class WalletExportRequest(BaseModel):
+    passphrase: str
+
+
+@app.post("/api/wallet/export/{address}")
+async def export_wallet_key(address: str, req: WalletExportRequest):
     """
     Export wallet private key (requires keystore passphrase for security).
+    Uses POST so the passphrase is in the request body, never in URL params or logs.
     WARNING: This exposes the private key. Use with extreme caution.
     """
     if not wallet_orchestrator:
         raise HTTPException(500, "Wallet orchestrator not initialized")
-    
+
     # Verify passphrase matches
     env_passphrase = os.getenv("MM_KEYSTORE_PASSPHRASE", "change-this-in-production")
-    if passphrase != env_passphrase:
+    if req.passphrase != env_passphrase:
         raise HTTPException(401, "Invalid passphrase")
-    
+
     # Get the key
     key_bytes = wallet_orchestrator.get_signing_key(address)
     if not key_bytes:
         raise HTTPException(404, "Wallet not found")
-    
+
     import base58
     from solders.keypair import Keypair
-    
+
     # Convert to different formats
     keypair = Keypair.from_bytes(key_bytes)
-    
+
     # Return in multiple formats for compatibility
     private_key_base58 = base58.b58encode(bytes(keypair)).decode()
     private_key_hex = bytes(keypair).hex()
     private_key_array = list(bytes(keypair))
-    
+
     return {
         "address": address,
         "private_key_base58": private_key_base58,

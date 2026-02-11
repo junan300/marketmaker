@@ -90,19 +90,99 @@ class EncryptedKeyStore:
     """
     Fernet-encrypted wallet storage.
     Keys are encrypted at rest using a passphrase-derived key.
+    Salt is randomly generated per keystore and stored in a companion file.
     """
+
+    # Legacy fixed salt — used to decrypt keystores created before per-keystore salts
+    _LEGACY_SALT = b"solana-mm-keystore-v1"
 
     def __init__(self, passphrase: str, store_path: Path = None):
         self._store_path = store_path or WALLET_DIR / "keystore.enc"
+        self._salt_path = self._store_path.with_suffix(".salt")
         self._store_path.parent.mkdir(parents=True, exist_ok=True)
-        self._fernet = self._derive_fernet(passphrase)
-        self._cache: dict = {}  # address -> encrypted_key (decrypted on demand)
+        self._passphrase = passphrase
+
+        salt = self._load_or_create_salt()
+        self._fernet = self._derive_fernet(passphrase, salt)
+
+        # If migrating from legacy fixed salt, re-encrypt with new salt
+        self._migrate_legacy_salt_if_needed(passphrase)
+
+    def _load_or_create_salt(self) -> bytes:
+        """Load existing salt from file, or generate a new random one."""
+        if self._salt_path.exists():
+            salt = self._salt_path.read_bytes()
+            if len(salt) >= 16:
+                return salt
+            logger.warning("Salt file corrupted, regenerating")
+
+        # No salt file yet — check if a keystore already exists (legacy)
+        if self._store_path.exists():
+            # Existing keystore with no salt file → legacy fixed salt.
+            # We'll migrate after verifying decryption works.
+            logger.info("Legacy keystore detected (no salt file). Will migrate to per-keystore salt.")
+            return self._LEGACY_SALT
+
+        # Brand-new keystore — generate random salt
+        salt = os.urandom(32)
+        self._salt_path.write_bytes(salt)
+        logger.info("Generated new random salt for keystore")
+        return salt
+
+    def _migrate_legacy_salt_if_needed(self, passphrase: str):
+        """
+        If the keystore was created with the old fixed salt, re-encrypt
+        all keys under a new random salt so every installation is unique.
+        """
+        if self._salt_path.exists():
+            return  # Already using per-keystore salt
+
+        if not self._store_path.exists():
+            return  # No keystore to migrate
+
+        store = self._load_store()
+        if not store:
+            return  # Empty keystore, nothing to migrate
+
+        # Decrypt all keys with the legacy fernet (current self._fernet)
+        legacy_fernet = self._fernet
+        decrypted_entries = {}
+        for address, entry in store.items():
+            try:
+                plaintext = legacy_fernet.decrypt(entry["encrypted_key"].encode())
+                decrypted_entries[address] = (plaintext, entry)
+            except Exception:
+                logger.error(f"Could not decrypt {address[:8]}... during migration — skipping")
+                decrypted_entries[address] = (None, entry)
+
+        # Generate new random salt and derive new fernet
+        new_salt = os.urandom(32)
+        new_fernet = self._derive_fernet(passphrase, new_salt)
+
+        # Re-encrypt all keys with the new salt
+        migrated_store = {}
+        for address, (plaintext, entry) in decrypted_entries.items():
+            if plaintext is None:
+                # Keep the entry as-is (couldn't decrypt — don't lose it)
+                migrated_store[address] = entry
+                continue
+            migrated_store[address] = {
+                "encrypted_key": new_fernet.encrypt(plaintext).decode(),
+                "label": entry.get("label", ""),
+                "created_at": entry.get("created_at", 0),
+            }
+
+        # Persist new salt and re-encrypted keystore atomically:
+        # write salt first so if we crash mid-save, we can still re-derive
+        self._salt_path.write_bytes(new_salt)
+        self._save_store(migrated_store)
+        self._fernet = new_fernet
+
+        logger.info(f"Migrated {len(decrypted_entries)} wallet(s) from legacy fixed salt to per-keystore random salt")
 
     @staticmethod
-    def _derive_fernet(passphrase: str) -> Fernet:
+    def _derive_fernet(passphrase: str, salt: bytes) -> Fernet:
         """Derive encryption key from passphrase using PBKDF2."""
-        # Use a fixed salt (in production, store per-keystore salt)
-        salt = b"solana-mm-keystore-v1"
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,

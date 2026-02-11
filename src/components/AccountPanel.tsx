@@ -46,8 +46,8 @@ const AccountPanel: React.FC<AccountPanelProps> = ({ account }) => {
     
     setExportError(null)
     try {
-      const response = await axios.get(`/api/wallet/export/${account.public_key}`, {
-        params: { passphrase }
+      const response = await axios.post(`/api/wallet/export/${account.public_key}`, {
+        passphrase
       })
       setExportData(response.data)
     } catch (error: any) {
