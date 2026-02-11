@@ -1,10 +1,9 @@
-import React, { useState } from 'react'
+import React from 'react'
 import { useStatus } from '../context/StatusContext'
 import ControlPanel from './ControlPanel'
 import StatsPanel from './StatsPanel'
 import AccountPanel from './AccountPanel'
 import ConfigPanel from './ConfigPanel'
-import WalletManagement from './WalletManagement'
 import './Dashboard.css'
 
 interface DashboardProps {
