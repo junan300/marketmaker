@@ -1,0 +1,33 @@
+# Core Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Solana
+solana>=0.32.0
+solders>=0.20.0
+anchorpy>=0.18.0
+
+# HTTP Client (for Jupiter API)
+httpx>=0.27.0
+
+# Encryption (for wallet keystore)
+cryptography>=42.0.0
+
+# WebSocket support
+websockets>=12.0
+
+# Database (PostgreSQL-ready, using SQLite for dev)
+# Uncomment for production PostgreSQL:
+# asyncpg>=0.29.0
+# sqlalchemy>=2.0.0
+
+# Logging
+python-json-logger>=2.0.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# Utilities
+base58>=2.1.1

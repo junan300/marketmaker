@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+dist/
+*.log
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Wallet keys (IMPORTANT - never commit these!)
+*.json
+!package.json
+!tsconfig.json
+!tsconfig.node.json
+wallet.json
+keypair.json
+
+# Encrypted keystore and wallet data
+data/wallets/
+data/*.db
+data/*.log
+keystore.enc
+*.enc
+*.backup
+
+# Wallet export files (contain private keys!)
+wallet-export-*.txt
+*-export-*.txt
+
+# Scripts that handle sensitive operations (optional - you may want to exclude these)
+# Uncomment the lines below if you don't want to commit these scripts:
+# export-wallet-simple.py
+# migrate-passphrase.py
+# view-passphrase.py
+# check-wallet.py
