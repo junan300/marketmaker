@@ -260,6 +260,7 @@ class WalletOrchestrator:
         self._wallets: dict[str, WalletInfo] = {}  # address -> WalletInfo
         self._round_robin_index = 0
         self._lock = Lock()
+        self._active_wallets: set[str] = set()  # Set of active wallet addresses
 
     def register_wallet(
         self,
@@ -442,3 +443,46 @@ class WalletOrchestrator:
         NEVER log this. NEVER include in error messages.
         """
         return self.keystore.get_key(address)
+
+    # ── Active Wallet Management ──────────────────────────────────────
+
+    def set_active_wallets(self, addresses: list[str]):
+        """Set which wallets are active (for display and manual trading)."""
+        with self._lock:
+            # Only set wallets that exist
+            valid_addresses = [addr for addr in addresses if addr in self._wallets]
+            self._active_wallets = set(valid_addresses)
+            logger.info(f"Active wallets set: {len(valid_addresses)} wallets")
+
+    def add_active_wallet(self, address: str):
+        """Add a wallet to the active set."""
+        with self._lock:
+            if address in self._wallets:
+                self._active_wallets.add(address)
+                logger.info(f"Wallet {address[:8]}... added to active set")
+
+    def remove_active_wallet(self, address: str):
+        """Remove a wallet from the active set."""
+        with self._lock:
+            self._active_wallets.discard(address)
+            logger.info(f"Wallet {address[:8]}... removed from active set")
+
+    def get_active_wallets(self) -> list[str]:
+        """Get list of active wallet addresses."""
+        with self._lock:
+            return list(self._active_wallets)
+
+    def get_primary_wallet(self) -> Optional[WalletInfo]:
+        """Get the primary active wallet (first one, or first enabled wallet if none active)."""
+        with self._lock:
+            if self._active_wallets:
+                # Return first active wallet
+                for addr in self._active_wallets:
+                    if addr in self._wallets:
+                        return self._wallets[addr]
+            # Fallback to first enabled wallet
+            enabled = [w for w in self._wallets.values() 
+                      if w.health != WalletHealth.DISABLED]
+            if enabled:
+                return enabled[0]
+            return None

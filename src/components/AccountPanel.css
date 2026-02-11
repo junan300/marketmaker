@@ -22,6 +22,118 @@
   border-bottom: none;
 }
 
+.wallets-summary {
+  background: #f5f5f5;
+  padding: 10px 15px;
+  border-radius: 6px;
+  margin: 10px 0;
+}
+
+.wallets-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.btn-manage-link {
+  background: #2196f3;
+  color: white;
+  border: none;
+  padding: 4px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: background 0.2s;
+}
+
+.btn-manage-link:hover {
+  background: #1976d2;
+}
+
+.wallets-preview {
+  margin-top: 15px;
+  padding: 15px;
+  background: #f9f9f9;
+  border-radius: 8px;
+  border: 1px solid #e0e0e0;
+}
+
+.wallets-preview-header {
+  margin-bottom: 10px;
+  font-weight: 600;
+  color: #666;
+  font-size: 0.9rem;
+}
+
+.wallets-preview-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.wallet-preview-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  background: white;
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+
+.wallet-preview-label {
+  font-weight: 500;
+  color: #666;
+  min-width: 80px;
+}
+
+.wallet-preview-address {
+  font-family: monospace;
+  font-size: 0.8rem;
+  color: #333;
+  flex: 1;
+}
+
+.wallet-preview-balance {
+  font-weight: 600;
+  color: #4caf50;
+  margin-left: auto;
+}
+
+.wallet-preview-status {
+  font-size: 0.9rem;
+}
+
+.wallet-preview-status.disabled {
+  opacity: 0.5;
+}
+
+.wallet-preview-more {
+  text-align: center;
+  color: #999;
+  font-size: 0.85rem;
+  font-style: italic;
+  padding: 5px;
+}
+
+.btn-view-all {
+  width: 100%;
+  background: #4caf50;
+  color: white;
+  border: none;
+  padding: 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: background 0.2s;
+  margin-top: 10px;
+}
+
+.btn-view-all:hover {
+  background: #45a049;
+}
+
 .label {
   font-weight: 600;
   color: #666;
@@ -78,6 +190,38 @@
   font-size: 0.9rem;
   flex: 1;
   word-break: break-all;
+}
+
+.wallet-select {
+  flex: 1;
+  padding: 8px 12px;
+  border: 2px solid #e0e0e0;
+  border-radius: 6px;
+  font-family: 'Courier New', monospace;
+  font-size: 0.9rem;
+  background: white;
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+
+.wallet-select:hover {
+  border-color: #2196f3;
+}
+
+.wallet-select:focus {
+  outline: none;
+  border-color: #2196f3;
+}
+
+.address-value-full {
+  background: #f5f5f5;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-family: 'Courier New', monospace;
+  font-size: 0.85rem;
+  word-break: break-all;
+  display: block;
+  width: 100%;
 }
 
 .copy-btn {
@@ -250,4 +394,213 @@
 
 .export-results button:hover {
   background: #5568d3;
+}
+
+.wallet-trading-section {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid #eee;
+}
+
+.btn-trading-toggle {
+  background: #667eea;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9rem;
+  width: 100%;
+  margin-bottom: 10px;
+  transition: background 0.2s;
+}
+
+.btn-trading-toggle:hover {
+  background: #5568d3;
+}
+
+.trading-controls {
+  padding: 15px;
+  background: #f9f9f9;
+  border-radius: 8px;
+  border: 1px solid #e0e0e0;
+}
+
+.trading-input-group {
+  margin-bottom: 15px;
+}
+
+.trading-input-group label {
+  display: block;
+  font-weight: 600;
+  color: #666;
+  margin-bottom: 8px;
+  font-size: 0.9rem;
+}
+
+.token-mint-input {
+  width: 100%;
+  padding: 10px;
+  border: 2px solid #ddd;
+  border-radius: 6px;
+  font-family: monospace;
+  font-size: 0.85rem;
+  box-sizing: border-box;
+}
+
+.token-mint-input:focus {
+  outline: none;
+  border-color: #667eea;
+}
+
+.trading-buttons {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.btn-trade {
+  flex: 1;
+  padding: 12px 20px;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9rem;
+  transition: all 0.2s;
+}
+
+.btn-trade:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-trade-buy {
+  background: #4caf50;
+  color: white;
+}
+
+.btn-trade-buy:hover:not(:disabled) {
+  background: #45a049;
+}
+
+.btn-trade-sell {
+  background: #f44336;
+  color: white;
+}
+
+.btn-trade-sell:hover:not(:disabled) {
+  background: #d32f2f;
+}
+
+.trading-note {
+  font-size: 0.85rem;
+  color: #666;
+  margin: 0;
+  font-style: italic;
+}
+
+.wallet-take-profit-section {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid #eee;
+}
+
+.take-profit-controls {
+  padding: 15px;
+  background: #f9f9f9;
+  border-radius: 8px;
+  border: 1px solid #e0e0e0;
+}
+
+.take-profit-status h4 {
+  margin-top: 0;
+  color: #333;
+  font-size: 1rem;
+}
+
+.profit-info {
+  margin: 15px 0;
+}
+
+.profit-info p {
+  margin: 8px 0;
+  font-size: 0.9rem;
+  color: #666;
+}
+
+.profit-positive {
+  color: #4caf50;
+  font-weight: 600;
+}
+
+.profit-negative {
+  color: #f44336;
+  font-weight: 600;
+}
+
+.target-reached {
+  background: #e8f5e9;
+  color: #2e7d32;
+  padding: 10px;
+  border-radius: 6px;
+  font-weight: 600;
+  margin-top: 10px;
+}
+
+.btn-remove-profit {
+  background: #f44336;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 10px 20px;
+  cursor: pointer;
+  font-weight: 600;
+  margin-top: 10px;
+}
+
+.btn-remove-profit:hover {
+  background: #d32f2f;
+}
+
+.take-profit-setup {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.profit-percentage-input {
+  width: 100%;
+  padding: 10px;
+  border: 2px solid #ddd;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  box-sizing: border-box;
+}
+
+.profit-percentage-input:focus {
+  outline: none;
+  border-color: #667eea;
+}
+
+.btn-set-profit {
+  background: #2196f3;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 12px 20px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9rem;
+  transition: background 0.2s;
+}
+
+.btn-set-profit:hover:not(:disabled) {
+  background: #1976d2;
+}
+
+.btn-set-profit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }

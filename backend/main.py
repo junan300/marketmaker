@@ -27,6 +27,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # Import all v2 layers
 from backend.auth import AuthMiddleware, load_api_key_from_env, get_bind_host
 from backend.risk_manager import RiskManager, RiskRules, TradeIntent
@@ -65,6 +68,9 @@ mm_task: Optional[asyncio.Task] = None
 risk_manager = RiskManager()
 wallet_orchestrator: Optional[WalletOrchestrator] = None
 profit_taker = ProfitTaker()
+
+# Take profit targets: wallet_address -> {token_mint, profit_percentage, initial_price, auto_sell}
+take_profit_targets: dict[str, dict] = {}
 
 
 # ── App Lifecycle ───────────────────────────────────────────────────
@@ -231,6 +237,24 @@ class WalletImportRequest(BaseModel):
     private_key: str
 
 
+class ActiveWalletsRequest(BaseModel):
+    addresses: list[str]
+
+
+class WalletTradeRequest(BaseModel):
+    token_mint: str
+    side: str  # "buy" or "sell"
+    percentage: float = 5.0  # Percentage of wallet balance to use
+    max_slippage: float = 2.0
+
+
+class TakeProfitRequest(BaseModel):
+    wallet_address: str
+    token_mint: str
+    profit_percentage: float  # Take profit when token value increases by this %
+    auto_sell: bool = True  # Automatically sell when target is reached
+
+
 # ══════════════════════════════════════════════════════════════════════
 # HEALTH CHECK (no auth)
 # ══════════════════════════════════════════════════════════════════════
@@ -335,6 +359,202 @@ async def enable_wallet(address: str):
     if wallet_orchestrator:
         wallet_orchestrator.enable_wallet(address)
     return {"status": "enabled"}
+
+
+@app.post("/api/v2/wallets/active")
+async def set_active_wallets(req: ActiveWalletsRequest):
+    """Set which wallets are active for display and manual trading."""
+    if not wallet_orchestrator:
+        raise HTTPException(500, "Wallet orchestrator not initialized")
+    wallet_orchestrator.set_active_wallets(req.addresses)
+    return {"status": "updated", "active_wallets": wallet_orchestrator.get_active_wallets()}
+
+
+@app.get("/api/v2/wallets/active")
+async def get_active_wallets():
+    """Get list of active wallet addresses."""
+    if not wallet_orchestrator:
+        return {"active_wallets": []}
+    return {"active_wallets": wallet_orchestrator.get_active_wallets()}
+
+
+@app.post("/api/v2/wallets/{address}/active")
+async def toggle_active_wallet(address: str):
+    """Add or remove a wallet from the active set."""
+    if not wallet_orchestrator:
+        raise HTTPException(500, "Wallet orchestrator not initialized")
+    
+    active = wallet_orchestrator.get_active_wallets()
+    if address in active:
+        wallet_orchestrator.remove_active_wallet(address)
+        return {"status": "removed", "active": False}
+    else:
+        wallet_orchestrator.add_active_wallet(address)
+        return {"status": "added", "active": True}
+
+
+@app.post("/api/v2/wallets/{address}/trade")
+async def wallet_trade(address: str, req: WalletTradeRequest):
+    """Execute a small buy or sell trade for a specific wallet."""
+    if not wallet_orchestrator:
+        raise HTTPException(500, "Wallet orchestrator not initialized")
+    
+    wallet_info = wallet_orchestrator.get_wallet_info(address)
+    if not wallet_info:
+        raise HTTPException(404, f"Wallet {address} not found")
+    
+    if wallet_info["health"] == "disabled":
+        raise HTTPException(400, "Wallet is disabled")
+    
+    # Calculate trade amount (percentage of wallet balance)
+    balance_sol = wallet_info["balance_sol"]
+    trade_amount_sol = balance_sol * (req.percentage / 100.0)
+    
+    if trade_amount_sol < 0.01:
+        raise HTTPException(400, f"Insufficient balance for {req.percentage}% trade")
+    
+    # Get signing key
+    signing_key = wallet_orchestrator.get_signing_key(address)
+    if not signing_key:
+        raise HTTPException(500, "Failed to get wallet signing key")
+    
+    # Initialize Jupiter adapter
+    jupiter = JupiterAdapter()
+    
+    # Execute swap
+    try:
+        from solana.rpc.async_api import AsyncClient
+        from solders.keypair import Keypair
+        from solders.transaction import VersionedTransaction
+        
+        # Create keypair from signing key
+        if len(signing_key) == 64:
+            keypair = Keypair.from_bytes(signing_key)
+        elif len(signing_key) == 32:
+            keypair = Keypair.from_seed(signing_key)
+        else:
+            raise Exception(f"Invalid key length: {len(signing_key)}")
+        
+        wallet_pubkey = str(keypair.pubkey())
+        
+        async def sign_and_send(tx_bytes: bytes) -> str:
+            """Sign and send transaction."""
+            from solana.rpc.async_api import AsyncClient
+            from solders.transaction import VersionedTransaction
+            
+            # Deserialize transaction
+            unsigned_tx = VersionedTransaction.from_bytes(tx_bytes)
+            # Sign it
+            signed_tx = VersionedTransaction(unsigned_tx.message, [keypair])
+            
+            # Send to Solana
+            rpc_url = os.getenv("RPC_URL", settings.rpc_url)
+            async with AsyncClient(rpc_url) as client:
+                result = await client.send_transaction(signed_tx)
+                return str(result.value) if result.value else ""
+        
+        result = await jupiter.execute_swap(
+            wallet_address=wallet_pubkey,
+            token_mint=req.token_mint,
+            side=req.side,
+            amount_sol=trade_amount_sol,
+            max_slippage=req.max_slippage,
+            sign_and_send=sign_and_send,
+        )
+        
+        # Update wallet balance
+        rpc_url = os.getenv("RPC_URL", settings.rpc_url)
+        await wallet_orchestrator.refresh_balances(rpc_url)
+        
+        return {
+            "status": "success",
+            "wallet": address,
+            "side": req.side,
+            "amount_sol": trade_amount_sol,
+            "percentage": req.percentage,
+            "transaction": result.get("signature"),
+        }
+    except Exception as e:
+        logger.error(f"Wallet trade failed: {e}")
+        raise HTTPException(500, f"Trade execution failed: {str(e)}")
+
+
+@app.post("/api/v2/wallets/{address}/take-profit")
+async def set_take_profit(address: str, req: TakeProfitRequest):
+    """Set a take profit target for a wallet's token position."""
+    if not wallet_orchestrator:
+        raise HTTPException(500, "Wallet orchestrator not initialized")
+    
+    wallet_info = wallet_orchestrator.get_wallet_info(address)
+    if not wallet_info:
+        raise HTTPException(404, f"Wallet {address} not found")
+    
+    # Get current token price from Jupiter
+    jupiter = JupiterAdapter()
+    current_price = await jupiter.get_price_in_sol(req.token_mint)
+    
+    if current_price is None:
+        raise HTTPException(400, "Failed to get token price from Jupiter")
+    
+    # Store take profit target
+    take_profit_targets[address] = {
+        "token_mint": req.token_mint,
+        "profit_percentage": req.profit_percentage,
+        "initial_price": current_price,
+        "auto_sell": req.auto_sell,
+        "target_price": current_price * (1 + req.profit_percentage / 100.0),
+    }
+    
+    logger.info(f"Take profit set for {address[:8]}...: {req.profit_percentage}% target")
+    
+    return {
+        "status": "set",
+        "wallet": address,
+        "token_mint": req.token_mint,
+        "initial_price": current_price,
+        "target_price": take_profit_targets[address]["target_price"],
+        "profit_percentage": req.profit_percentage,
+    }
+
+
+@app.get("/api/v2/wallets/{address}/take-profit")
+async def get_take_profit(address: str):
+    """Get take profit target for a wallet."""
+    target = take_profit_targets.get(address)
+    if not target:
+        return {"status": "not_set"}
+    
+    # Get current price
+    jupiter = JupiterAdapter()
+    current_price = await jupiter.get_price_in_sol(target["token_mint"])
+    
+    if current_price is None:
+        current_price = target["initial_price"]
+    
+    profit_pct = ((current_price - target["initial_price"]) / target["initial_price"]) * 100.0
+    
+    return {
+        "status": "active",
+        "wallet": address,
+        "token_mint": target["token_mint"],
+        "initial_price": target["initial_price"],
+        "current_price": current_price,
+        "target_price": target["target_price"],
+        "profit_percentage": target["profit_percentage"],
+        "current_profit_pct": profit_pct,
+        "auto_sell": target["auto_sell"],
+        "target_reached": current_price >= target["target_price"],
+    }
+
+
+@app.delete("/api/v2/wallets/{address}/take-profit")
+async def remove_take_profit(address: str):
+    """Remove take profit target for a wallet."""
+    if address in take_profit_targets:
+        del take_profit_targets[address]
+        logger.info(f"Take profit removed for {address[:8]}...")
+        return {"status": "removed"}
+    return {"status": "not_found"}
 
 
 # ── Risk Management ─────────────────────────────────────────────────
@@ -536,18 +756,38 @@ async def legacy_status():
         "total_wallets": 0, "wallets": [], "total_balance_sol": 0
     }
     wallets = pool.get("wallets", [])
-    first_wallet = wallets[0] if wallets else None
+    
+    # Get primary active wallet, or fallback to first enabled wallet
+    primary_wallet = None
+    if wallet_orchestrator:
+        primary_wallet_info = wallet_orchestrator.get_primary_wallet()
+        if primary_wallet_info:
+            primary_wallet = {"address": primary_wallet_info.address}
+    
+    # Fallback to first enabled wallet if no active wallet
+    if not primary_wallet:
+        enabled_wallets = [w for w in wallets if w.get("health") != "disabled"]
+        primary_wallet = enabled_wallets[0] if enabled_wallets else None
+        if not primary_wallet and wallets:
+            primary_wallet = wallets[0]
 
     running = market_maker._running if market_maker else False
     stats = market_maker._stats if market_maker else {}
+
+    # Count enabled wallets
+    enabled_wallets = [w for w in wallets if w.get("health") != "disabled"]
+    enabled_count = len(enabled_wallets)
 
     return {
         "is_running": running,
         "account": {
             "wallet_loaded": pool["total_wallets"] > 0,
-            "public_key": first_wallet["address"] if first_wallet else None,
+            "public_key": primary_wallet["address"] if primary_wallet else None,
             "balance": pool.get("total_balance_sol", 0),
             "network": os.getenv("SOLANA_NETWORK", settings.solana_network),
+            "total_wallets": pool["total_wallets"],
+            "enabled_wallets": enabled_count,
+            "all_wallets": wallets,  # Include all wallets for reference
         },
         "stats": {
             "total_trades": stats.get("trades_filled", 0),
@@ -576,13 +816,33 @@ async def legacy_account():
         "total_wallets": 0, "wallets": [], "total_balance_sol": 0
     }
     wallets = pool.get("wallets", [])
-    first_wallet = wallets[0] if wallets else None
+    
+    # Get primary active wallet, or fallback to first enabled wallet
+    primary_wallet = None
+    if wallet_orchestrator:
+        primary_wallet_info = wallet_orchestrator.get_primary_wallet()
+        if primary_wallet_info:
+            primary_wallet = {"address": primary_wallet_info.address}
+    
+    # Fallback to first enabled wallet if no active wallet
+    if not primary_wallet:
+        enabled_wallets = [w for w in wallets if w.get("health") != "disabled"]
+        primary_wallet = enabled_wallets[0] if enabled_wallets else None
+        if not primary_wallet and wallets:
+            primary_wallet = wallets[0]
+    
+    # Count enabled wallets
+    enabled_wallets = [w for w in wallets if w.get("health") != "disabled"]
+    enabled_count = len(enabled_wallets)
 
     return {
         "wallet_loaded": pool["total_wallets"] > 0,
-        "public_key": first_wallet["address"] if first_wallet else None,
+        "public_key": primary_wallet["address"] if primary_wallet else None,
         "balance": pool.get("total_balance_sol", 0),
         "network": os.getenv("SOLANA_NETWORK", settings.solana_network),
+        "total_wallets": pool["total_wallets"],
+        "enabled_wallets": enabled_count,
+        "all_wallets": wallets,  # Include all wallets for reference
     }
 
 
@@ -646,15 +906,27 @@ async def export_wallet_key(address: str, req: WalletExportRequest):
         raise HTTPException(401, "Invalid passphrase")
 
     # Get the key
-    key_bytes = wallet_orchestrator.get_signing_key(address)
+    try:
+        key_bytes = wallet_orchestrator.get_signing_key(address)
+    except Exception as e:
+        raise HTTPException(500, f"Error retrieving wallet key: {str(e)}")
+    
     if not key_bytes:
         raise HTTPException(404, "Wallet not found")
 
-    import base58
-    from solders.keypair import Keypair
+    try:
+        import base58
+        from solders.keypair import Keypair
 
-    # Convert to different formats
-    keypair = Keypair.from_bytes(key_bytes)
+        # Convert to different formats - handle both 64-byte and 32-byte keys
+        if len(key_bytes) == 64:
+            keypair = Keypair.from_bytes(key_bytes)
+        elif len(key_bytes) == 32:
+            keypair = Keypair.from_seed(key_bytes)
+        else:
+            raise ValueError(f"Invalid key length: {len(key_bytes)}. Expected 32 or 64 bytes.")
+    except Exception as e:
+        raise HTTPException(500, f"Error converting key: {str(e)}")
 
     # Return in multiple formats for compatibility
     private_key_base58 = base58.b58encode(bytes(keypair)).decode()

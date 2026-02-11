@@ -163,6 +163,55 @@ RPC_URL=https://api.mainnet-beta.solana.com
 
 ⚠️ **Warning:** Always test thoroughly on devnet before using mainnet!
 
+## Finding Trading Pairs & Testing on Mainnet
+
+### Finding Trading Pairs
+
+**Problem**: Devnet has limited liquidity and few real trading pairs, making it hard to test realistic conditions.
+
+**Solution**: Use the included helper script to find available tokens:
+
+```bash
+# List tokens with liquidity on mainnet
+python find-trading-pairs.py list mainnet
+
+# Search for a specific token
+python find-trading-pairs.py search USDC
+
+# See well-known tokens
+python find-trading-pairs.py well-known mainnet
+```
+
+**Alternative Methods**:
+- **Jupiter Token List**: https://token.jup.ag/all (mainnet) or https://token.jup.ag/devnet
+- **Jupiter Swap Interface**: https://jup.ag/ (browse tokens and copy mint addresses)
+- **Solana Explorer**: https://explorer.solana.com/ (search for tokens)
+
+### Testing on Mainnet
+
+**⚠️ CRITICAL**: Mainnet uses **REAL SOL** - every transaction costs real money!
+
+Before testing on mainnet, read the comprehensive guide:
+- **[MAINNET_TESTING_GUIDE.md](MAINNET_TESTING_GUIDE.md)** - Complete guide covering:
+  - All risks and potential problems
+  - How to find trading pairs on both devnet and mainnet
+  - Recommended testing strategy (start small!)
+  - Emergency procedures
+  - Pre-mainnet checklist
+
+**Quick Start for Mainnet Testing**:
+1. Read `MAINNET_TESTING_GUIDE.md` first
+2. Use `find-trading-pairs.py` to find a high-liquidity token
+3. Start with **minimal amounts** (0.01 SOL per trade)
+4. Lower risk limits in your `.env`:
+   ```
+   BASE_TRADE_SIZE_SOL=0.01
+   MAX_POSITION_SIZE_SOL=0.5
+   MAX_EXPOSURE_PER_TOKEN=1.0
+   TOTAL_MAX_EXPOSURE=2.0
+   ```
+5. Monitor closely and scale up gradually
+
 ## Project Structure
 
 ```
