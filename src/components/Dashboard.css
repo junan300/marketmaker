@@ -48,6 +48,58 @@
   border-color: rgba(255, 255, 255, 0.5);
 }
 
+/* Capital Overview Bar */
+.capital-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding: 16px 20px;
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
+}
+
+.capital-bar-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: 1;
+  min-width: 100px;
+  padding: 4px 8px;
+}
+
+.capital-label {
+  font-size: 0.75rem;
+  color: #999;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+
+.capital-value {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: #333;
+}
+
+.capital-sub {
+  font-size: 0.8rem;
+  color: #888;
+  margin-top: 2px;
+}
+
+.phase-item {
+  border-left: 2px solid #e0e0e0;
+  padding-left: 16px;
+}
+
+.phase-badge {
+  font-size: 0.9rem !important;
+  color: #667eea !important;
+  font-weight: 600 !important;
+}
+
 .dashboard-loading {
   display: flex;
   flex-direction: column;
@@ -96,9 +148,27 @@
   .account-card {
     grid-column: span 2;
   }
-  
+
   .control-card {
     grid-column: span 2;
+  }
+}
+
+@media (max-width: 767px) {
+  .capital-bar {
+    gap: 8px;
+    padding: 12px 14px;
+  }
+
+  .capital-bar-item {
+    min-width: 70px;
+    flex-basis: calc(33% - 8px);
+  }
+
+  .phase-item {
+    border-left: none;
+    padding-left: 8px;
+    flex-basis: 100%;
   }
 }
 
@@ -106,19 +176,19 @@
   .dashboard-grid {
     grid-template-columns: repeat(2, 1fr);
   }
-  
+
   .account-card {
     grid-column: span 1;
   }
-  
+
   .control-card {
     grid-column: span 1;
   }
-  
+
   .stats-card {
     grid-column: span 1;
   }
-  
+
   .config-card {
     grid-column: span 1;
   }

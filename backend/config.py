@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
 
+    # Capital Brain settings
+    total_budget_usd: float = 1000.0
+    sol_price_cache_seconds: int = 60
+
     class Config:
         env_file = ".env"
         case_sensitive = False

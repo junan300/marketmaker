@@ -1,6 +1,18 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react'
 import axios from 'axios'
 
+interface CapitalStatus {
+  total_budget_usd: number
+  total_budget_sol: number
+  deployed_capital_usd: number
+  deployed_capital_sol: number
+  available_capital_usd: number
+  available_capital_sol: number
+  capital_utilization_pct: number
+  sol_price_usd: number
+  price_last_updated: number
+}
+
 interface StatusData {
   is_running: boolean
   account: {
@@ -21,6 +33,8 @@ interface StatusData {
     min_balance: number
     network: string
   }
+  capital?: CapitalStatus
+  bonding_phase?: string
 }
 
 interface StatusContextType {

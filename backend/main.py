@@ -1,12 +1,15 @@
 """
-FastAPI Server — Integrated v2 with Backward-Compatible v1 Routes
+FastAPI Server — Integrated v2 with Percentage-Based Capital Allocation
 
 The v2 architecture layers:
 - Auth middleware (API key + rate limiting, localhost bypass for dev)
-- Risk management with circuit breakers and stop losses
+- Risk management with circuit breakers and stop losses (percentage-based)
+- Capital Brain: central capital management with SOL/USD price tracking
+- Bonding curve phase management (manual override via API)
 - Multi-wallet orchestration with encrypted keystore
 - Wyckoff phase detection for automated buy/sell signals
 - Jupiter DEX integration for real Solana swaps
+- Dynamic trade sizing via TradeSizeCalculator
 - Order management with retry logic
 - Profit-taking schedules (TWAP, price targets)
 - SQLite persistence + audit trail
@@ -46,6 +49,11 @@ from backend.profit_taker import ProfitTaker
 from backend.dex.jupiter import JupiterAdapter
 from backend.market_maker_v2 import MarketMakerV2, TradingConfig
 from backend.config import settings
+from backend.capital_brain import CapitalBrain
+from backend.trade_size_calculator import TradeSizeCalculator
+from backend.phase_config import (
+    BondingCurvePhase, PhaseConfig, DEFAULT_PHASE_CONFIGS, get_phase_config,
+)
 
 # ── Logging Setup ───────────────────────────────────────────────────
 
@@ -65,9 +73,13 @@ logger = logging.getLogger("main")
 
 market_maker: Optional[MarketMakerV2] = None
 mm_task: Optional[asyncio.Task] = None
-risk_manager = RiskManager()
+jupiter: Optional[JupiterAdapter] = None
+capital_brain: Optional[CapitalBrain] = None
+trade_calculator: Optional[TradeSizeCalculator] = None
+risk_manager: Optional[RiskManager] = None
 wallet_orchestrator: Optional[WalletOrchestrator] = None
 profit_taker = ProfitTaker()
+current_phase: BondingCurvePhase = BondingCurvePhase.STEALTH_ACCUMULATION
 
 # Take profit targets: wallet_address -> {token_mint, profit_percentage, initial_price, auto_sell}
 take_profit_targets: dict[str, dict] = {}
@@ -77,15 +89,38 @@ take_profit_targets: dict[str, dict] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global jupiter, capital_brain, trade_calculator, risk_manager, wallet_orchestrator
+
     # Startup
     os.makedirs("data", exist_ok=True)
     init_database()
     load_api_key_from_env()
 
+    # Initialize Jupiter adapter (used by Capital Brain for SOL/USD price)
+    jupiter = JupiterAdapter()
+
+    # Initialize Capital Brain
+    total_budget = float(os.getenv("TOTAL_BUDGET_USD", str(settings.total_budget_usd)))
+    cache_ttl = int(os.getenv("SOL_PRICE_CACHE_SECONDS", str(settings.sol_price_cache_seconds)))
+    capital_brain = CapitalBrain(
+        total_budget_usd=total_budget,
+        jupiter=jupiter,
+        cache_ttl_s=cache_ttl,
+    )
+
+    # Initialize Trade Size Calculator
+    trade_calculator = TradeSizeCalculator(capital_brain)
+
+    # Initialize Risk Manager with Capital Brain
+    risk_manager = RiskManager(capital_brain=capital_brain)
+
+    # Apply phase-specific risk rules
+    phase_config = get_phase_config(current_phase)
+    risk_manager.update_from_phase_config(phase_config)
+
     # Initialize encrypted keystore
     passphrase = os.getenv("MM_KEYSTORE_PASSPHRASE", "change-this-in-production")
     keystore = EncryptedKeyStore(passphrase)
-    global wallet_orchestrator
     wallet_orchestrator = WalletOrchestrator(keystore)
 
     # Auto-import existing wallet.json if it exists (v1 compatibility)
@@ -94,7 +129,10 @@ async def lifespan(app: FastAPI):
     # Re-register wallets already in the encrypted keystore
     _restore_keystore_wallets(keystore, wallet_orchestrator)
 
-    logger.info("Server starting — all layers initialized")
+    logger.info(
+        f"Server starting — Capital Brain initialized with ${total_budget:.0f} budget, "
+        f"phase={current_phase.value}"
+    )
     yield
 
     # Shutdown
@@ -163,8 +201,8 @@ def _restore_keystore_wallets(keystore: EncryptedKeyStore, orchestrator: WalletO
 
 app = FastAPI(
     title="Solana Market Maker",
-    description="Automated market maker with Wyckoff strategy, risk management, and Jupiter DEX integration",
-    version="2.0.0",
+    description="Automated market maker with percentage-based capital allocation, Wyckoff strategy, and Jupiter DEX",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -190,7 +228,7 @@ app.add_middleware(
 
 class StartRequest(BaseModel):
     token_mint: str
-    cycle_interval_s: float = 15.0
+    phase: Optional[str] = None  # Optional bonding curve phase override
 
 
 class WalletRegisterRequest(BaseModel):
@@ -201,20 +239,26 @@ class WalletRegisterRequest(BaseModel):
 
 
 class RiskRulesUpdate(BaseModel):
+    max_position_per_wallet_pct: Optional[float] = None
+    max_exposure_per_token_pct: Optional[float] = None
+    total_max_exposure_pct: Optional[float] = None
+    max_daily_volume_pct: Optional[float] = None
     max_drawdown_percent: Optional[float] = None
-    max_daily_volume: Optional[float] = None
-    total_max_exposure: Optional[float] = None
     max_trades_per_minute: Optional[int] = None
     max_consecutive_losses: Optional[int] = None
     stop_loss_percent: Optional[float] = None
 
 
 class TradingConfigUpdate(BaseModel):
-    base_trade_size_sol: Optional[float] = None
-    strong_signal_multiplier: Optional[float] = None
-    stop_loss_percent: Optional[float] = None
     min_confidence: Optional[float] = None
-    max_slippage_percent: Optional[float] = None
+
+
+class BudgetUpdate(BaseModel):
+    total_budget_usd: float
+
+
+class PhaseSetRequest(BaseModel):
+    phase: str  # "stealth_accumulation", "stabilization", "graduation_push"
 
 
 class ProfitTargetRequest(BaseModel):
@@ -261,7 +305,7 @@ class TakeProfitRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "2.0.0"}
+    return {"status": "ok", "version": "2.1.0"}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -272,7 +316,7 @@ async def health():
 
 @app.post("/api/v2/start")
 async def start_market_maker_v2(req: StartRequest):
-    global market_maker, mm_task
+    global market_maker, mm_task, current_phase
 
     if market_maker and market_maker._running:
         raise HTTPException(400, "Market maker already running")
@@ -284,16 +328,30 @@ async def start_market_maker_v2(req: StartRequest):
     if pool_status["total_wallets"] == 0:
         raise HTTPException(400, "No wallets registered. Add wallets first.")
 
+    # Handle optional phase override
+    if req.phase:
+        try:
+            current_phase = BondingCurvePhase(req.phase)
+        except ValueError:
+            raise HTTPException(400, f"Invalid phase: {req.phase}. Use one of: {[p.value for p in BondingCurvePhase]}")
+
     market_maker = MarketMakerV2(
         wallet_orchestrator=wallet_orchestrator,
         token_mint=req.token_mint,
+        capital_brain=capital_brain,
+        trade_calculator=trade_calculator,
         risk_manager=risk_manager,
         profit_taker=profit_taker,
+        initial_phase=current_phase,
     )
-    market_maker.set_cycle_interval(req.cycle_interval_s)
 
     mm_task = asyncio.create_task(market_maker.start())
-    return {"status": "started", "token_mint": req.token_mint}
+    return {
+        "status": "started",
+        "token_mint": req.token_mint,
+        "phase": current_phase.value,
+        "budget_usd": capital_brain.total_budget_usd if capital_brain else 0,
+    }
 
 
 @app.post("/api/v2/stop")
@@ -313,9 +371,132 @@ async def get_status_v2():
         return market_maker.get_status()
     return {
         "running": False,
-        "risk": risk_manager.get_status(),
+        "risk": risk_manager.get_status() if risk_manager else {},
         "wallet_pool": wallet_orchestrator.get_pool_status() if wallet_orchestrator else {},
         "profit_taking": profit_taker.get_status(),
+        "capital": capital_brain.get_status() if capital_brain else {},
+        "bonding_phase": {
+            "current": current_phase.value,
+            "config": get_phase_config(current_phase).to_dict(),
+        },
+    }
+
+
+# ── Capital Brain Endpoints ────────────────────────────────────────
+
+@app.get("/api/v2/capital")
+async def get_capital_status():
+    """Get capital brain status (budget, deployed, available, SOL price)."""
+    if not capital_brain:
+        raise HTTPException(500, "Capital brain not initialized")
+
+    status = capital_brain.get_status()
+
+    # Include effective trade sizes for current phase
+    if trade_calculator:
+        phase_config = get_phase_config(current_phase)
+        status["effective_sizes"] = trade_calculator.get_effective_sizes(phase_config)
+
+    return status
+
+
+@app.put("/api/v2/capital/budget")
+async def update_budget(req: BudgetUpdate):
+    """Update total operational budget at runtime."""
+    if not capital_brain:
+        raise HTTPException(500, "Capital brain not initialized")
+
+    if req.total_budget_usd <= 0:
+        raise HTTPException(400, "Budget must be positive")
+
+    old_budget = capital_brain.total_budget_usd
+    capital_brain.total_budget_usd = req.total_budget_usd
+
+    # Update market maker if running
+    if market_maker:
+        market_maker.capital_brain.total_budget_usd = req.total_budget_usd
+
+    logger.info(f"Budget updated: ${old_budget:.0f} -> ${req.total_budget_usd:.0f}")
+
+    return {
+        "status": "updated",
+        "old_budget_usd": old_budget,
+        "new_budget_usd": req.total_budget_usd,
+        "capital": capital_brain.get_status(),
+    }
+
+
+# ── Phase Management Endpoints ─────────────────────────────────────
+
+@app.get("/api/v2/phases/current")
+async def get_current_phase():
+    """Get current bonding curve phase and its configuration."""
+    phase_config = get_phase_config(current_phase)
+    result = {
+        "phase": current_phase.value,
+        "config": phase_config.to_dict(),
+    }
+
+    # Include effective trade sizes
+    if trade_calculator:
+        result["effective_sizes"] = trade_calculator.get_effective_sizes(phase_config)
+
+    return result
+
+
+@app.post("/api/v2/phases/set")
+async def set_phase(req: PhaseSetRequest):
+    """Manually set the bonding curve phase."""
+    global current_phase
+
+    try:
+        new_phase = BondingCurvePhase(req.phase)
+    except ValueError:
+        raise HTTPException(
+            400,
+            f"Invalid phase: {req.phase}. Use one of: {[p.value for p in BondingCurvePhase]}"
+        )
+
+    old_phase = current_phase
+    current_phase = new_phase
+
+    # Update market maker if running
+    if market_maker:
+        market_maker.set_phase(new_phase)
+
+    # Update risk manager with new phase rules
+    phase_config = get_phase_config(new_phase)
+    if risk_manager:
+        risk_manager.update_from_phase_config(phase_config)
+
+    logger.info(f"Phase changed: {old_phase.value} -> {new_phase.value}")
+
+    result = {
+        "status": "updated",
+        "old_phase": old_phase.value,
+        "new_phase": new_phase.value,
+        "config": phase_config.to_dict(),
+    }
+
+    if trade_calculator:
+        result["effective_sizes"] = trade_calculator.get_effective_sizes(phase_config)
+
+    return result
+
+
+@app.get("/api/v2/phases/configs")
+async def get_all_phase_configs():
+    """Get all phase configurations (for display in UI)."""
+    configs = {}
+    for phase, config in DEFAULT_PHASE_CONFIGS.items():
+        entry = config.to_dict()
+        if trade_calculator:
+            entry["effective_sizes"] = trade_calculator.get_effective_sizes(config)
+        configs[phase.value] = entry
+
+    return {
+        "current_phase": current_phase.value,
+        "phases": configs,
     }
 
 
@@ -408,7 +589,7 @@ async def toggle_active_wallet(address: str):
     """Add or remove a wallet from the active set."""
     if not wallet_orchestrator:
         raise HTTPException(500, "Wallet orchestrator not initialized")
-    
+
     active = wallet_orchestrator.get_active_wallets()
     if address in active:
         wallet_orchestrator.remove_active_wallet(address)
@@ -423,35 +604,35 @@ async def wallet_trade(address: str, req: WalletTradeRequest):
     """Execute a small buy or sell trade for a specific wallet."""
     if not wallet_orchestrator:
         raise HTTPException(500, "Wallet orchestrator not initialized")
-    
+
     wallet_info = wallet_orchestrator.get_wallet_info(address)
     if not wallet_info:
         raise HTTPException(404, f"Wallet {address} not found")
-    
+
     if wallet_info["health"] == "disabled":
         raise HTTPException(400, "Wallet is disabled")
-    
+
     # Calculate trade amount (percentage of wallet balance)
     balance_sol = wallet_info["balance_sol"]
     trade_amount_sol = balance_sol * (req.percentage / 100.0)
-    
+
     if trade_amount_sol < 0.01:
         raise HTTPException(400, f"Insufficient balance for {req.percentage}% trade")
-    
+
     # Get signing key
     signing_key = wallet_orchestrator.get_signing_key(address)
     if not signing_key:
         raise HTTPException(500, "Failed to get wallet signing key")
-    
+
     # Initialize Jupiter adapter
-    jupiter = JupiterAdapter()
-    
+    jup = JupiterAdapter()
+
     # Execute swap
     try:
         from solana.rpc.async_api import AsyncClient
         from solders.keypair import Keypair
         from solders.transaction import VersionedTransaction
-        
+
         # Create keypair from signing key
         if len(signing_key) == 64:
             keypair = Keypair.from_bytes(signing_key)
@@ -459,26 +640,26 @@ async def wallet_trade(address: str, req: WalletTradeRequest):
             keypair = Keypair.from_seed(signing_key)
         else:
             raise Exception(f"Invalid key length: {len(signing_key)}")
-        
+
         wallet_pubkey = str(keypair.pubkey())
-        
+
         async def sign_and_send(tx_bytes: bytes) -> str:
             """Sign and send transaction."""
             from solana.rpc.async_api import AsyncClient
             from solders.transaction import VersionedTransaction
-            
+
             # Deserialize transaction
             unsigned_tx = VersionedTransaction.from_bytes(tx_bytes)
             # Sign it
             signed_tx = VersionedTransaction(unsigned_tx.message, [keypair])
-            
+
             # Send to Solana
             rpc_url = os.getenv("RPC_URL", settings.rpc_url)
             async with AsyncClient(rpc_url) as client:
                 result = await client.send_transaction(signed_tx)
                 return str(result.value) if result.value else ""
-        
-        result = await jupiter.execute_swap(
+
+        result = await jup.execute_swap(
             wallet_address=wallet_pubkey,
             token_mint=req.token_mint,
             side=req.side,
@@ -486,11 +667,11 @@ async def wallet_trade(address: str, req: WalletTradeRequest):
             max_slippage=req.max_slippage,
             sign_and_send=sign_and_send,
         )
-        
+
         # Update wallet balance
         rpc_url = os.getenv("RPC_URL", settings.rpc_url)
         await wallet_orchestrator.refresh_balances(rpc_url)
-        
+
         return {
             "status": "success",
             "wallet": address,
@@ -509,18 +690,18 @@ async def set_take_profit(address: str, req: TakeProfitRequest):
     """Set a take profit target for a wallet's token position."""
     if not wallet_orchestrator:
         raise HTTPException(500, "Wallet orchestrator not initialized")
-    
+
     wallet_info = wallet_orchestrator.get_wallet_info(address)
     if not wallet_info:
         raise HTTPException(404, f"Wallet {address} not found")
-    
+
     # Get current token price from Jupiter
-    jupiter = JupiterAdapter()
-    current_price = await jupiter.get_price_in_sol(req.token_mint)
-    
+    jup = JupiterAdapter()
+    current_price = await jup.get_price_in_sol(req.token_mint)
+
     if current_price is None:
         raise HTTPException(400, "Failed to get token price from Jupiter")
-    
+
     # Store take profit target
     take_profit_targets[address] = {
         "token_mint": req.token_mint,
@@ -529,9 +710,9 @@ async def set_take_profit(address: str, req: TakeProfitRequest):
         "auto_sell": req.auto_sell,
         "target_price": current_price * (1 + req.profit_percentage / 100.0),
     }
-    
+
     logger.info(f"Take profit set for {address[:8]}...: {req.profit_percentage}% target")
-    
+
     return {
         "status": "set",
         "wallet": address,
@@ -548,16 +729,16 @@ async def get_take_profit(address: str):
     target = take_profit_targets.get(address)
     if not target:
         return {"status": "not_set"}
-    
+
     # Get current price
-    jupiter = JupiterAdapter()
-    current_price = await jupiter.get_price_in_sol(target["token_mint"])
-    
+    jup = JupiterAdapter()
+    current_price = await jup.get_price_in_sol(target["token_mint"])
+
     if current_price is None:
         current_price = target["initial_price"]
-    
+
     profit_pct = ((current_price - target["initial_price"]) / target["initial_price"]) * 100.0
-    
+
     return {
         "status": "active",
         "wallet": address,
@@ -586,11 +767,15 @@ async def remove_take_profit(address: str):
 
 @app.get("/api/v2/risk")
 async def get_risk_status():
+    if not risk_manager:
+        return {}
     return risk_manager.get_status()
 
 
 @app.put("/api/v2/risk/rules")
 async def update_risk_rules(rules: RiskRulesUpdate):
+    if not risk_manager:
+        raise HTTPException(500, "Risk manager not initialized")
     updates = {k: v for k, v in rules.model_dump().items() if v is not None}
     risk_manager.update_rules(**updates)
     return {"status": "updated", "rules": updates}
@@ -598,7 +783,8 @@ async def update_risk_rules(rules: RiskRulesUpdate):
 
 @app.post("/api/v2/risk/emergency-shutdown")
 async def emergency_shutdown():
-    risk_manager.emergency_shutdown()
+    if risk_manager:
+        risk_manager.emergency_shutdown()
     if market_maker:
         market_maker.stop()
     return {"status": "emergency_shutdown_activated"}
@@ -606,13 +792,15 @@ async def emergency_shutdown():
 
 @app.post("/api/v2/risk/reset-emergency")
 async def reset_emergency():
-    risk_manager.reset_emergency()
+    if risk_manager:
+        risk_manager.reset_emergency()
     return {"status": "emergency_cleared"}
 
 
 @app.post("/api/v2/risk/reset-circuit-breaker")
 async def reset_circuit_breaker():
-    risk_manager.circuit_breaker.reset()
+    if risk_manager:
+        risk_manager.circuit_breaker.reset()
     return {"status": "circuit_breaker_reset"}
 
 
@@ -622,23 +810,27 @@ async def reset_circuit_breaker():
 async def get_trading_config():
     if market_maker:
         cfg = market_maker.trading_config
-        return {
-            "base_trade_size_sol": cfg.base_trade_size_sol,
-            "strong_signal_multiplier": cfg.strong_signal_multiplier,
-            "stop_loss_percent": cfg.stop_loss_percent,
+        phase_cfg = market_maker.phase_config
+        result = {
             "min_confidence": cfg.min_confidence,
-            "max_slippage_percent": cfg.max_slippage_percent,
-            "min_trade_size_sol": cfg.min_trade_size_sol,
-            "max_trade_size_sol": cfg.max_trade_size_sol,
+            "phase": market_maker.current_phase.value,
+            "phase_config": phase_cfg.to_dict(),
         }
-    # Return defaults from env
+        if trade_calculator:
+            result["effective_sizes"] = trade_calculator.get_effective_sizes(phase_cfg)
+        return result
+
+    # Return defaults
     cfg = TradingConfig.from_env()
-    return {
-        "base_trade_size_sol": cfg.base_trade_size_sol,
-        "stop_loss_percent": cfg.stop_loss_percent,
+    phase_cfg = get_phase_config(current_phase)
+    result = {
         "min_confidence": cfg.min_confidence,
-        "max_slippage_percent": cfg.max_slippage_percent,
+        "phase": current_phase.value,
+        "phase_config": phase_cfg.to_dict(),
     }
+    if trade_calculator:
+        result["effective_sizes"] = trade_calculator.get_effective_sizes(phase_cfg)
+    return result
 
 
 @app.put("/api/v2/trading/config")
@@ -646,9 +838,6 @@ async def update_trading_config(cfg: TradingConfigUpdate):
     updates = {k: v for k, v in cfg.model_dump().items() if v is not None}
     if market_maker:
         market_maker.update_trading_config(**updates)
-    # Also update risk manager stop loss if provided
-    if "stop_loss_percent" in updates:
-        risk_manager.update_rules(stop_loss_percent=updates["stop_loss_percent"])
     return {"status": "updated", "config": updates}
 
 
@@ -745,8 +934,10 @@ async def websocket_status(ws: WebSocket):
             else:
                 status = {
                     "running": False,
-                    "risk": risk_manager.get_status(),
+                    "risk": risk_manager.get_status() if risk_manager else {},
                     "wallet_pool": wallet_orchestrator.get_pool_status() if wallet_orchestrator else {},
+                    "capital": capital_brain.get_status() if capital_brain else {},
+                    "bonding_phase": current_phase.value,
                 }
             await ws.send_json(status)
             await asyncio.sleep(5)
@@ -763,7 +954,7 @@ async def websocket_status(ws: WebSocket):
 
 @app.get("/")
 async def root():
-    return {"message": "Solana Market Maker API", "version": "2.0.0"}
+    return {"message": "Solana Market Maker API", "version": "2.1.0"}
 
 
 @app.get("/api/status")
@@ -776,19 +967,19 @@ async def legacy_status():
     if wallet_orchestrator:
         rpc_url = os.getenv("RPC_URL", settings.rpc_url)
         await wallet_orchestrator.refresh_balances(rpc_url)
-    
+
     pool = wallet_orchestrator.get_pool_status() if wallet_orchestrator else {
         "total_wallets": 0, "wallets": [], "total_balance_sol": 0
     }
     wallets = pool.get("wallets", [])
-    
+
     # Get primary active wallet, or fallback to first enabled wallet
     primary_wallet = None
     if wallet_orchestrator:
         primary_wallet_info = wallet_orchestrator.get_primary_wallet()
         if primary_wallet_info:
             primary_wallet = {"address": primary_wallet_info.address}
-    
+
     # Fallback to first enabled wallet if no active wallet
     if not primary_wallet:
         enabled_wallets = [w for w in wallets if w.get("health") != "disabled"]
@@ -803,6 +994,9 @@ async def legacy_status():
     enabled_wallets = [w for w in wallets if w.get("health") != "disabled"]
     enabled_count = len(enabled_wallets)
 
+    # Capital info for v1 frontend
+    capital_info = capital_brain.get_status() if capital_brain else {}
+
     return {
         "is_running": running,
         "account": {
@@ -812,7 +1006,7 @@ async def legacy_status():
             "network": os.getenv("SOLANA_NETWORK", settings.solana_network),
             "total_wallets": pool["total_wallets"],
             "enabled_wallets": enabled_count,
-            "all_wallets": wallets,  # Include all wallets for reference
+            "all_wallets": wallets,
         },
         "stats": {
             "total_trades": stats.get("trades_filled", 0),
@@ -822,10 +1016,12 @@ async def legacy_status():
         },
         "config": {
             "spread_percentage": settings.spread_percentage,
-            "order_size": float(os.getenv("BASE_TRADE_SIZE_SOL", str(settings.order_size))),
+            "order_size": settings.order_size,
             "min_balance": settings.min_balance,
             "network": os.getenv("SOLANA_NETWORK", settings.solana_network),
         },
+        "capital": capital_info,
+        "bonding_phase": current_phase.value,
     }
 
 
@@ -836,26 +1032,26 @@ async def legacy_account():
     if wallet_orchestrator:
         rpc_url = os.getenv("RPC_URL", settings.rpc_url)
         await wallet_orchestrator.refresh_balances(rpc_url)
-    
+
     pool = wallet_orchestrator.get_pool_status() if wallet_orchestrator else {
         "total_wallets": 0, "wallets": [], "total_balance_sol": 0
     }
     wallets = pool.get("wallets", [])
-    
+
     # Get primary active wallet, or fallback to first enabled wallet
     primary_wallet = None
     if wallet_orchestrator:
         primary_wallet_info = wallet_orchestrator.get_primary_wallet()
         if primary_wallet_info:
             primary_wallet = {"address": primary_wallet_info.address}
-    
+
     # Fallback to first enabled wallet if no active wallet
     if not primary_wallet:
         enabled_wallets = [w for w in wallets if w.get("health") != "disabled"]
         primary_wallet = enabled_wallets[0] if enabled_wallets else None
         if not primary_wallet and wallets:
             primary_wallet = wallets[0]
-    
+
     # Count enabled wallets
     enabled_wallets = [w for w in wallets if w.get("health") != "disabled"]
     enabled_count = len(enabled_wallets)
@@ -867,7 +1063,7 @@ async def legacy_account():
         "network": os.getenv("SOLANA_NETWORK", settings.solana_network),
         "total_wallets": pool["total_wallets"],
         "enabled_wallets": enabled_count,
-        "all_wallets": wallets,  # Include all wallets for reference
+        "all_wallets": wallets,
     }
 
 
@@ -899,10 +1095,10 @@ async def refresh_wallet_balance():
     """Refresh wallet balances from Solana blockchain."""
     if not wallet_orchestrator:
         raise HTTPException(500, "Wallet orchestrator not initialized")
-    
+
     rpc_url = os.getenv("RPC_URL", settings.rpc_url)
     await wallet_orchestrator.refresh_balances(rpc_url)
-    
+
     pool = wallet_orchestrator.get_pool_status()
     return {
         "success": True,
@@ -935,7 +1131,7 @@ async def export_wallet_key(address: str, req: WalletExportRequest):
         key_bytes = wallet_orchestrator.get_signing_key(address)
     except Exception as e:
         raise HTTPException(500, f"Error retrieving wallet key: {str(e)}")
-    
+
     if not key_bytes:
         raise HTTPException(404, "Wallet not found")
 
@@ -972,15 +1168,15 @@ async def legacy_import_wallet(request: WalletImportRequest):
     """v1 import wallet — accepts private key in various formats."""
     if not wallet_orchestrator:
         raise HTTPException(500, "Wallet orchestrator not initialized")
-    
+
     private_key = request.private_key
     if not private_key:
         raise HTTPException(400, "private_key is required")
-    
+
     try:
         import base58
         from solders.keypair import Keypair
-        
+
         # Handle different input formats
         key_bytes = None
         if isinstance(private_key, str):
@@ -1003,7 +1199,7 @@ async def legacy_import_wallet(request: WalletImportRequest):
             key_bytes = bytes(private_key)
         else:
             raise HTTPException(400, "Invalid private key format")
-        
+
         # Create keypair and get address
         if len(key_bytes) == 64:
             keypair = Keypair.from_bytes(key_bytes)
@@ -1011,15 +1207,15 @@ async def legacy_import_wallet(request: WalletImportRequest):
             keypair = Keypair.from_seed(key_bytes)
         else:
             raise HTTPException(400, f"Invalid key length: {len(key_bytes)}. Expected 32 or 64 bytes.")
-        
+
         address = str(keypair.pubkey())
-        
+
         # Store encrypted and register
         wallet_orchestrator.keystore.store_key(address, bytes(keypair), label="imported_via_ui")
         wallet_orchestrator.register_wallet(address, role=WalletRole.TRADING, label="imported via UI")
-        
+
         logger.info(f"Wallet imported via UI: {address[:8]}...")
-        
+
         return {
             "success": True,
             "public_key": address,
@@ -1051,12 +1247,12 @@ async def legacy_start():
     market_maker = MarketMakerV2(
         wallet_orchestrator=wallet_orchestrator,
         token_mint=token_mint,
+        capital_brain=capital_brain,
+        trade_calculator=trade_calculator,
         risk_manager=risk_manager,
         profit_taker=profit_taker,
+        initial_phase=current_phase,
     )
-
-    cycle_interval = float(os.getenv("CYCLE_INTERVAL_S", "15.0"))
-    market_maker.set_cycle_interval(cycle_interval)
 
     mm_task = asyncio.create_task(market_maker.start())
 
@@ -1064,6 +1260,7 @@ async def legacy_start():
         "success": True,
         "message": "Market maker started",
         "token_mint": token_mint,
+        "phase": current_phase.value,
     }
 
 
@@ -1100,12 +1297,8 @@ async def legacy_stats():
 
 @app.put("/api/marketmaker/config")
 async def legacy_update_config(config: MarketMakerConfig):
-    """v1 config update — maps to v2 risk rules and trading config."""
+    """v1 config update — maps to v2 trading config."""
     updates = {}
-    if config.order_size is not None:
-        if market_maker:
-            market_maker.update_trading_config(base_trade_size_sol=config.order_size)
-        updates["order_size"] = config.order_size
     if config.min_balance is not None:
         updates["min_balance"] = config.min_balance
 
@@ -1113,7 +1306,7 @@ async def legacy_update_config(config: MarketMakerConfig):
         "success": True,
         "config": {
             "spread_percentage": config.spread_percentage or settings.spread_percentage,
-            "order_size": config.order_size or float(os.getenv("BASE_TRADE_SIZE_SOL", str(settings.order_size))),
+            "order_size": config.order_size or settings.order_size,
             "min_balance": config.min_balance or settings.min_balance,
         },
     }

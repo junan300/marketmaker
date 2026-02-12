@@ -3,7 +3,7 @@ Risk & Position Management Layer
 
 Every trade MUST pass through evaluate_trade() before execution.
 - Circuit breakers (rapid price change, consecutive failures)
-- Position limits and exposure caps
+- Position limits and exposure caps (percentage-based via Capital Brain)
 - Per-position stop loss
 - Emergency shutdown
 - Drawdown protection
@@ -33,15 +33,15 @@ class CircuitBreakerState(Enum):
 
 @dataclass
 class RiskRules:
-    """Configurable risk parameters. Adjust per your risk tolerance."""
+    """Configurable risk parameters — percentage-based via Capital Brain."""
 
-    # Per-wallet limits
-    max_position_size_per_wallet: float = 10.0   # SOL
-    max_exposure_per_token: float = 50.0          # SOL across all wallets
+    # Per-wallet limits (% of total budget)
+    max_position_per_wallet_pct: float = 15.0
+    max_exposure_per_token_pct: float = 50.0
 
-    # System-wide limits
-    total_max_exposure: float = 100.0             # SOL total
-    max_daily_volume: float = 500.0               # SOL daily turnover
+    # System-wide limits (% of total budget)
+    total_max_exposure_pct: float = 80.0
+    max_daily_volume_pct: float = 100.0
 
     # Frequency controls
     max_trades_per_minute: int = 10
@@ -109,7 +109,7 @@ class RiskDecision:
 
 
 class CircuitBreaker:
-    """Three-state circuit breaker: CLOSED → OPEN → HALF_OPEN → CLOSED"""
+    """Three-state circuit breaker: CLOSED -> OPEN -> HALF_OPEN -> CLOSED"""
 
     def __init__(self, cooldown_s: int = 300):
         self.state = CircuitBreakerState.CLOSED
@@ -174,14 +174,24 @@ class RiskManager:
     """
     Central risk management engine. Every trade intent MUST pass through
     evaluate_trade() before execution. No exceptions.
+
+    Uses Capital Brain for percentage-based limit calculations.
     """
 
-    def __init__(self, rules: Optional[RiskRules] = None):
+    def __init__(self, rules: Optional[RiskRules] = None, capital_brain=None):
         self.rules = rules or RiskRules()
         self.state = RiskState()
         self.circuit_breaker = CircuitBreaker(self.rules.breaker_cooldown_s)
+        self.capital_brain = capital_brain
         self._lock = Lock()
         self._price_history: list = []
+
+    def _get_limit_sol(self, pct: float) -> float:
+        """Convert a percentage-of-total-budget to SOL using Capital Brain."""
+        if self.capital_brain and self.capital_brain.sol_price_usd > 0:
+            return (pct / 100) * self.capital_brain.total_budget_usd / self.capital_brain.sol_price_usd
+        # Fallback: return a large number so checks don't block when capital brain isn't ready
+        return float('inf')
 
     def evaluate_trade(self, intent: TradeIntent) -> RiskDecision:
         """Run all risk checks against a trade intent."""
@@ -222,50 +232,58 @@ class RiskManager:
         else:
             checks_passed.append("Cooldown OK")
 
-        # 4. Per-wallet position limit
+        # 4. Per-wallet position limit (% of total budget)
         wallet_exposure = self.state.wallet_exposures.get(intent.wallet_address, 0.0)
+        max_wallet_sol = self._get_limit_sol(self.rules.max_position_per_wallet_pct)
         if intent.side == "buy":
             new_exposure = wallet_exposure + intent.amount_sol
-            if new_exposure > self.rules.max_position_size_per_wallet:
+            if new_exposure > max_wallet_sol:
                 checks_failed.append(
-                    f"Wallet exposure: {new_exposure:.2f} SOL > {self.rules.max_position_size_per_wallet} limit"
+                    f"Wallet exposure: {new_exposure:.4f} SOL > {max_wallet_sol:.4f} SOL "
+                    f"({self.rules.max_position_per_wallet_pct}% of budget)"
                 )
             else:
                 checks_passed.append("Wallet exposure OK")
         else:
             checks_passed.append("Wallet exposure OK (sell)")
 
-        # 5. Per-token exposure limit
+        # 5. Per-token exposure limit (% of total budget)
         token_exposure = self.state.token_exposures.get(intent.token_mint, 0.0)
+        max_token_sol = self._get_limit_sol(self.rules.max_exposure_per_token_pct)
         if intent.side == "buy":
             new_token_exposure = token_exposure + intent.amount_sol
-            if new_token_exposure > self.rules.max_exposure_per_token:
+            if new_token_exposure > max_token_sol:
                 checks_failed.append(
-                    f"Token exposure: {new_token_exposure:.2f} SOL > {self.rules.max_exposure_per_token} limit"
+                    f"Token exposure: {new_token_exposure:.4f} SOL > {max_token_sol:.4f} SOL "
+                    f"({self.rules.max_exposure_per_token_pct}% of budget)"
                 )
             else:
                 checks_passed.append("Token exposure OK")
         else:
             checks_passed.append("Token exposure OK (sell)")
 
-        # 6. Total system exposure
+        # 6. Total system exposure (% of total budget)
+        max_total_sol = self._get_limit_sol(self.rules.total_max_exposure_pct)
         if intent.side == "buy":
             new_total = self.state.total_exposure_sol + intent.amount_sol
-            if new_total > self.rules.total_max_exposure:
+            if new_total > max_total_sol:
                 checks_failed.append(
-                    f"Total exposure: {new_total:.2f} SOL > {self.rules.total_max_exposure} limit"
+                    f"Total exposure: {new_total:.4f} SOL > {max_total_sol:.4f} SOL "
+                    f"({self.rules.total_max_exposure_pct}% of budget)"
                 )
             else:
                 checks_passed.append("Total exposure OK")
         else:
             checks_passed.append("Total exposure OK (sell)")
 
-        # 7. Daily volume limit
+        # 7. Daily volume limit (% of total budget)
         self._reset_daily_volume_if_needed()
+        max_daily_sol = self._get_limit_sol(self.rules.max_daily_volume_pct)
         new_daily = self.state.daily_volume_sol + intent.amount_sol
-        if new_daily > self.rules.max_daily_volume:
+        if new_daily > max_daily_sol:
             checks_failed.append(
-                f"Daily volume: {new_daily:.2f} SOL > {self.rules.max_daily_volume} limit"
+                f"Daily volume: {new_daily:.4f} SOL > {max_daily_sol:.4f} SOL "
+                f"({self.rules.max_daily_volume_pct}% of budget)"
             )
         else:
             checks_passed.append("Daily volume OK")
@@ -296,6 +314,16 @@ class RiskManager:
         else:
             checks_passed.append(f"Drawdown OK ({drawdown:.1f}%)")
 
+        # 11. Capital utilization check (phase exposure limit)
+        if self.capital_brain:
+            utilization = self.capital_brain.capital_utilization_pct
+            if utilization >= self.rules.total_max_exposure_pct and intent.side == "buy":
+                checks_failed.append(
+                    f"Capital utilization: {utilization:.1f}% >= {self.rules.total_max_exposure_pct}% phase limit"
+                )
+            else:
+                checks_passed.append(f"Capital utilization OK ({utilization:.1f}%)")
+
         # Decision
         if checks_failed:
             decision = RiskDecision(
@@ -314,7 +342,7 @@ class RiskManager:
                 checks_passed=checks_passed,
                 checks_failed=[],
             )
-            logger.info(f"TRADE APPROVED: {intent.side} {intent.amount_sol} SOL")
+            logger.info(f"TRADE APPROVED: {intent.side} {intent.amount_sol:.4f} SOL")
 
         return decision
 
@@ -400,6 +428,26 @@ class RiskManager:
         self.circuit_breaker.reset()
         logger.info("Emergency shutdown cleared — trading can resume")
 
+    # ── Phase Integration ────────────────────────────────────────────
+
+    def update_from_phase_config(self, phase_config) -> None:
+        """Update risk rules from a bonding curve phase configuration."""
+        self.rules.max_position_per_wallet_pct = phase_config.max_position_per_wallet_pct
+        self.rules.total_max_exposure_pct = phase_config.max_phase_exposure_pct
+        self.rules.max_drawdown_percent = phase_config.max_drawdown_pct
+        self.rules.max_slippage_percent = phase_config.max_slippage_pct
+        self.rules.max_trades_per_minute = phase_config.max_trades_per_minute
+
+        if phase_config.stop_loss_enabled:
+            self.rules.stop_loss_percent = phase_config.stop_loss_pct
+
+        logger.info(
+            f"Risk rules updated from phase '{phase_config.phase_name}': "
+            f"max_wallet={phase_config.max_position_per_wallet_pct}%, "
+            f"max_exposure={phase_config.max_phase_exposure_pct}%, "
+            f"max_drawdown={phase_config.max_drawdown_pct}%"
+        )
+
     # ── Helpers ──────────────────────────────────────────────────────
 
     def _calculate_drawdown(self) -> float:
@@ -427,7 +475,7 @@ class RiskManager:
                 logger.warning(f"Unknown risk rule: {key}")
 
     def get_status(self) -> dict:
-        return {
+        status = {
             "circuit_breaker": self.circuit_breaker.to_dict(),
             "emergency_shutdown": self.state.emergency_shutdown,
             "total_exposure_sol": self.state.total_exposure_sol,
@@ -439,11 +487,24 @@ class RiskManager:
             "wallet_exposures": dict(self.state.wallet_exposures),
             "token_exposures": dict(self.state.token_exposures),
             "rules": {
+                "max_position_per_wallet_pct": self.rules.max_position_per_wallet_pct,
+                "max_exposure_per_token_pct": self.rules.max_exposure_per_token_pct,
+                "total_max_exposure_pct": self.rules.total_max_exposure_pct,
+                "max_daily_volume_pct": self.rules.max_daily_volume_pct,
                 "max_drawdown_percent": self.rules.max_drawdown_percent,
-                "max_daily_volume": self.rules.max_daily_volume,
-                "total_max_exposure": self.rules.total_max_exposure,
                 "max_trades_per_minute": self.rules.max_trades_per_minute,
                 "max_consecutive_losses": self.rules.max_consecutive_losses,
                 "stop_loss_percent": self.rules.stop_loss_percent,
             },
         }
+
+        # Include effective SOL limits if Capital Brain is available
+        if self.capital_brain and self.capital_brain.sol_price_usd > 0:
+            status["effective_limits_sol"] = {
+                "max_position_per_wallet_sol": round(self._get_limit_sol(self.rules.max_position_per_wallet_pct), 4),
+                "max_exposure_per_token_sol": round(self._get_limit_sol(self.rules.max_exposure_per_token_pct), 4),
+                "total_max_exposure_sol": round(self._get_limit_sol(self.rules.total_max_exposure_pct), 4),
+                "max_daily_volume_sol": round(self._get_limit_sol(self.rules.max_daily_volume_pct), 4),
+            }
+
+        return status

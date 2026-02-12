@@ -136,6 +136,19 @@ def init_database():
             CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(timestamp);
             CREATE INDEX IF NOT EXISTS idx_price_token_time ON price_history(token_mint, timestamp);
             CREATE INDEX IF NOT EXISTS idx_wallet_snap_time ON wallet_snapshots(wallet_address, timestamp);
+
+            CREATE TABLE IF NOT EXISTS capital_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                total_budget_usd REAL NOT NULL,
+                deployed_capital_usd REAL NOT NULL,
+                available_capital_usd REAL NOT NULL,
+                sol_usd_price REAL NOT NULL,
+                bonding_curve_phase TEXT,
+                capital_utilization_pct REAL,
+                timestamp REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_capital_snap_time ON capital_snapshots(timestamp);
         """)
         logger.info("Database initialized successfully")
 
@@ -439,3 +452,39 @@ def get_trade_stats() -> dict:
                FROM orders"""
         ).fetchone()
         return dict(row) if row else {}
+
+
+# ── Capital Snapshots ──────────────────────────────────────────────
+
+def record_capital_snapshot(
+    total_budget_usd: float,
+    deployed_capital_usd: float,
+    available_capital_usd: float,
+    sol_usd_price: float,
+    bonding_curve_phase: str = None,
+    capital_utilization_pct: float = None,
+):
+    """Record a capital state snapshot for historical tracking."""
+    now = time.time()
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO capital_snapshots
+               (total_budget_usd, deployed_capital_usd, available_capital_usd,
+                sol_usd_price, bonding_curve_phase, capital_utilization_pct, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (total_budget_usd, deployed_capital_usd, available_capital_usd,
+             sol_usd_price, bonding_curve_phase, capital_utilization_pct, now),
+        )
+
+
+def get_capital_snapshots(hours: int = 24) -> list:
+    """Get recent capital snapshots."""
+    cutoff = time.time() - (hours * 3600)
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT * FROM capital_snapshots
+               WHERE timestamp >= ?
+               ORDER BY timestamp ASC""",
+            (cutoff,),
+        ).fetchall()
+        return [dict(row) for row in rows]

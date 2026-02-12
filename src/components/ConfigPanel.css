@@ -30,6 +30,7 @@
   border-radius: 8px;
   font-size: 1rem;
   transition: border-color 0.3s ease;
+  box-sizing: border-box;
 }
 
 .config-item input:focus {
@@ -37,17 +38,98 @@
   border-color: #667eea;
 }
 
+.budget-input-row {
+  display: flex;
+  gap: 8px;
+}
+
+.budget-input-row input {
+  flex: 1;
+}
+
+.btn-apply {
+  padding: 12px 20px;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  white-space: nowrap;
+}
+
+.btn-apply:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+}
+
+.btn-apply:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.phase-select {
+  width: 100%;
+  padding: 12px;
+  border: 2px solid #e0e0e0;
+  border-radius: 8px;
+  font-size: 1rem;
+  background: white;
+  cursor: pointer;
+  transition: border-color 0.3s ease;
+  appearance: auto;
+}
+
+.phase-select:focus {
+  outline: none;
+  border-color: #667eea;
+}
+
+.phase-select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .config-info {
-  margin: 20px 0;
+  margin: 15px 0;
   padding: 15px;
   background: #f9f9f9;
   border-radius: 8px;
 }
 
 .config-info p {
-  margin: 0;
+  margin: 4px 0;
   color: #666;
   font-size: 0.9rem;
+}
+
+.config-info .section-label {
+  margin-bottom: 8px;
+  color: #333;
+}
+
+.effective-sizes {
+  background: #f0f4ff;
+  border: 1px solid #d0d8f0;
+}
+
+.phase-summary {
+  background: #f5f0ff;
+  border: 1px solid #d8d0f0;
+}
+
+.force-buy-badge {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 4px 10px;
+  background: #fff3e0;
+  color: #e65100;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  border: 1px solid #ffcc02;
 }
 
 .alert {

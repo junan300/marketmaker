@@ -1,22 +1,24 @@
 """
-Market Maker V2 — Full Layer Integration with Transaction Signing
+Market Maker V2 — Percentage-Based Capital Allocation with Capital Brain
 
 Flow per cycle:
-1. Fetch market data (price via Jupiter)
-2. Feed to Wyckoff detector → get phase + signal
-3. Check stop losses on open positions
-4. If signal suggests trade → create TradeIntent
-5. Risk Manager evaluates → APPROVED / REJECTED / HALTED
-6. If approved → Order Manager executes via Jupiter (sign & send)
-7. Record everything to database
-8. Check profit-taking schedule
-9. Sleep and repeat
+1. Refresh Capital Brain (SOL/USD price + wallet balances)
+2. Fetch market data (price via Jupiter)
+3. Feed to Wyckoff detector -> get phase + signal
+4. Check stop losses on open positions (phase-aware)
+5. If signal suggests trade -> create TradeIntent with dynamic sizing
+6. Risk Manager evaluates -> APPROVED / REJECTED / HALTED
+7. If approved -> Order Manager executes via Jupiter (sign & send)
+8. Record everything to database
+9. Check profit-taking schedule
+10. Sleep and repeat
 
-Trading Strategy (automated after parameters set):
-- BUY token with SOL when price is low (Accumulation phase / good value)
-- SELL token for SOL when demand increases (Distribution phase / high price)
-- STOP LOSS: auto-sell if any position drops below stop_loss_percent from entry
-- All trades gated by risk manager (position limits, drawdown, circuit breakers)
+Trading Strategy:
+- BUY token with SOL when Wyckoff signals accumulation + phase allows buying
+- SELL token for SOL when Wyckoff signals distribution + phase allows selling
+- Trade sizes are percentages of phase capital allocation, NOT fixed SOL amounts
+- Phase 1 (Stealth Accumulation): force buy mode, block sells
+- All trades gated by percentage-based risk manager
 """
 
 import os
@@ -34,6 +36,7 @@ from backend.database import (
     init_database, create_order, update_order_status,
     record_transaction, upsert_position, record_price,
     log_audit_event, record_wallet_snapshot, get_open_positions,
+    record_capital_snapshot,
 )
 from backend.strategy.wyckoff import (
     WyckoffDetector, MarketSnapshot, WyckoffPhase, TradeSignal,
@@ -41,6 +44,11 @@ from backend.strategy.wyckoff import (
 from backend.profit_taker import ProfitTaker
 from backend.dex.jupiter import JupiterAdapter
 from backend.wallet_manager import WalletOrchestrator, SelectionStrategy
+from backend.capital_brain import CapitalBrain
+from backend.trade_size_calculator import TradeSizeCalculator
+from backend.phase_config import (
+    BondingCurvePhase, PhaseConfig, DEFAULT_PHASE_CONFIGS, get_phase_config,
+)
 
 logger = logging.getLogger("market_maker_v2")
 
@@ -48,75 +56,71 @@ logger = logging.getLogger("market_maker_v2")
 @dataclass
 class TradingConfig:
     """
-    Configurable trading parameters — set these once and the bot runs automated.
-    Adjust via API at /api/v2/trading/config or environment variables.
+    Configurable trading parameters — percentage-based via Capital Brain.
+    Phase-specific settings (trade sizes, multipliers) come from PhaseConfig.
+    These are global overrides that apply across all phases.
     """
-    # Trade sizing
-    base_trade_size_sol: float = 0.1       # Default SOL per trade
-    strong_signal_multiplier: float = 2.0  # 2x size for STRONG_BUY/STRONG_SELL
-    min_trade_size_sol: float = 0.01       # Minimum trade (avoid dust)
-    max_trade_size_sol: float = 1.0        # Cap per single trade
-
-    # Stop loss (per-position, % below entry price)
-    stop_loss_percent: float = 10.0
-
     # Signal filtering
-    min_confidence: float = 0.5            # Minimum Wyckoff confidence to act
-
-    # Slippage
-    max_slippage_percent: float = 2.0      # Max acceptable slippage
+    min_confidence: float = 0.5
 
     @classmethod
     def from_env(cls) -> "TradingConfig":
         """Load config from environment variables with sensible defaults."""
         return cls(
-            base_trade_size_sol=float(os.getenv("BASE_TRADE_SIZE_SOL", "0.1")),
-            strong_signal_multiplier=float(os.getenv("STRONG_SIGNAL_MULTIPLIER", "2.0")),
-            min_trade_size_sol=float(os.getenv("MIN_TRADE_SIZE_SOL", "0.01")),
-            max_trade_size_sol=float(os.getenv("MAX_TRADE_SIZE_SOL", "1.0")),
-            stop_loss_percent=float(os.getenv("STOP_LOSS_PERCENT", "10.0")),
             min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.5")),
-            max_slippage_percent=float(os.getenv("MAX_SLIPPAGE_PERCENT", "2.0")),
         )
 
 
 class MarketMakerV2:
     """
-    Production market maker integrating all 7 architecture layers.
+    Production market maker with percentage-based capital allocation.
 
     Automated strategy:
-    - Buys token (sells SOL) when Wyckoff detects Accumulation (price is low/good value)
-    - Sells token (gets SOL) when Wyckoff detects Distribution (demand is high)
-    - Enforces per-position stop losses
-    - All trades pass through risk management
+    - Capital Brain tracks USD budget and converts percentages to SOL
+    - Bonding curve phases control capital allocation and trade sizing
+    - Wyckoff signals control when to buy/sell within each phase
+    - All risk limits are percentages of total budget
     """
 
     def __init__(
         self,
         wallet_orchestrator: WalletOrchestrator,
         token_mint: str,
+        capital_brain: CapitalBrain,
+        trade_calculator: TradeSizeCalculator,
         risk_manager: RiskManager = None,
         order_manager: OrderManager = None,
         wyckoff_detector: WyckoffDetector = None,
         profit_taker: ProfitTaker = None,
         jupiter: JupiterAdapter = None,
         trading_config: TradingConfig = None,
+        initial_phase: BondingCurvePhase = BondingCurvePhase.STEALTH_ACCUMULATION,
     ):
         self.wallet_orchestrator = wallet_orchestrator
         self.token_mint = token_mint
+        self.capital_brain = capital_brain
+        self.trade_calculator = trade_calculator
 
-        self.risk_manager = risk_manager or RiskManager()
+        self.risk_manager = risk_manager or RiskManager(capital_brain=capital_brain)
         self.order_manager = order_manager or OrderManager()
         self.wyckoff = wyckoff_detector or WyckoffDetector()
         self.profit_taker = profit_taker or ProfitTaker()
         self.jupiter = jupiter or JupiterAdapter()
         self.trading_config = trading_config or TradingConfig.from_env()
 
+        # Phase management
+        self.current_phase = initial_phase
+        self.phase_config = get_phase_config(initial_phase)
+
+        # Apply phase config to risk manager
+        self.risk_manager.update_from_phase_config(self.phase_config)
+
         # State
         self._running = False
         self._cycle_count = 0
         self._last_price = 0.0
-        self._cycle_interval_s = float(os.getenv("CYCLE_INTERVAL_S", "15.0"))
+        self._cycle_interval_s = self.phase_config.cycle_interval_s
+        self._capital_snapshot_interval = 50  # Record capital snapshot every N cycles
 
         # Stats
         self._stats = {
@@ -144,12 +148,14 @@ class MarketMakerV2:
         self._stats["started_at"] = time.time()
 
         log_audit_event("system", "operator", "start_market_maker",
-                        f"token:{self.token_mint}", "success")
+                        f"token:{self.token_mint}", "success",
+                        {"phase": self.current_phase.value,
+                         "budget_usd": self.capital_brain.total_budget_usd})
 
         logger.info(f"Market Maker V2 started for token {self.token_mint[:12]}...")
+        logger.info(f"Phase: {self.phase_config.phase_name}")
+        logger.info(f"Budget: ${self.capital_brain.total_budget_usd:.0f} USD")
         logger.info(f"Cycle interval: {self._cycle_interval_s}s")
-        logger.info(f"Trade size: {self.trading_config.base_trade_size_sol} SOL")
-        logger.info(f"Stop loss: {self.trading_config.stop_loss_percent}%")
 
         try:
             while self._running:
@@ -171,14 +177,40 @@ class MarketMakerV2:
                         f"token:{self.token_mint}", "success")
         logger.info("Market maker stopping...")
 
+    # ── Phase Management ─────────────────────────────────────────────
+
+    def set_phase(self, phase: BondingCurvePhase):
+        """Manually set the bonding curve phase."""
+        old_phase = self.current_phase
+        self.current_phase = phase
+        self.phase_config = get_phase_config(phase)
+
+        # Update cycle interval
+        self._cycle_interval_s = self.phase_config.cycle_interval_s
+
+        # Update risk manager limits
+        self.risk_manager.update_from_phase_config(self.phase_config)
+
+        log_audit_event("system", "operator", "phase_transition",
+                        f"token:{self.token_mint}", "success",
+                        {"from": old_phase.value, "to": phase.value})
+
+        logger.info(
+            f"Phase transition: {old_phase.value} -> {phase.value} "
+            f"({self.phase_config.phase_name})"
+        )
+
     # ── Main Cycle ──────────────────────────────────────────────────
 
     async def _run_cycle(self):
-        """One complete market making cycle — all 7 layers working together."""
+        """One complete market making cycle — all layers working together."""
         self._cycle_count += 1
         cycle_start = time.time()
 
         try:
+            # ── Capital Brain Refresh ────────────────────────────────
+            await self.capital_brain.refresh(self.wallet_orchestrator)
+
             # ── Layer 1: Market Data ────────────────────────────────
             price = await self._fetch_market_data()
             if price is None or price <= 0:
@@ -194,7 +226,9 @@ class MarketMakerV2:
                     f"price={price:.8f} "
                     f"phase={analysis.phase.value} "
                     f"signal={analysis.signal.value} "
-                    f"confidence={analysis.confidence:.0%}"
+                    f"confidence={analysis.confidence:.0%} "
+                    f"bonding_phase={self.current_phase.value} "
+                    f"capital_util={self.capital_brain.capital_utilization_pct:.1f}%"
                 )
 
             # ── Stop Loss Check ─────────────────────────────────────
@@ -204,7 +238,7 @@ class MarketMakerV2:
             await self._check_profit_taking(price, analysis)
 
             # ── Generate Trade Intent from Signal ───────────────────
-            trade_intent = self._signal_to_intent(analysis, price)
+            trade_intent = await self._signal_to_intent(analysis, price)
             if trade_intent is None:
                 return  # No action for this signal
 
@@ -221,6 +255,10 @@ class MarketMakerV2:
 
             # ── Layer 4+5: Execution ────────────────────────────────
             await self._execute_trade(trade_intent, price)
+
+            # ── Capital Snapshot ─────────────────────────────────────
+            if self._cycle_count % self._capital_snapshot_interval == 0:
+                self._record_capital_snapshot()
 
         except Exception as e:
             logger.error(f"Cycle {self._cycle_count} error: {e}", exc_info=True)
@@ -261,8 +299,15 @@ class MarketMakerV2:
     async def _check_stop_losses(self, current_price: float):
         """
         Check all open positions for stop-loss triggers.
-        If a position has dropped below stop_loss_percent from entry, force sell.
+        Respects phase config: stop loss can be disabled (e.g., during accumulation).
         """
+        if not self.phase_config.stop_loss_enabled:
+            return  # Stop loss disabled for this phase
+
+        stop_loss_pct = self.phase_config.stop_loss_pct
+        if stop_loss_pct <= 0:
+            return
+
         try:
             positions = get_open_positions()
         except Exception:
@@ -281,22 +326,30 @@ class MarketMakerV2:
             # Calculate loss percentage
             loss_pct = ((entry_price - current_price) / entry_price) * 100
 
-            if loss_pct >= self.trading_config.stop_loss_percent:
+            if loss_pct >= stop_loss_pct:
                 wallet_addr = pos["wallet_address"]
                 logger.warning(
                     f"STOP LOSS triggered: wallet {wallet_addr[:8]}... "
-                    f"loss={loss_pct:.1f}% (threshold: {self.trading_config.stop_loss_percent}%)"
+                    f"loss={loss_pct:.1f}% (threshold: {stop_loss_pct}%)"
                 )
                 self._stats["stop_losses_triggered"] += 1
+
+                # Calculate max sell size from phase config
+                phase_alloc_usd = self.capital_brain.get_phase_allocation_usd(
+                    self.phase_config.phase_capital_allocation_pct
+                )
+                max_trade_usd = (self.phase_config.max_trade_size_pct / 100) * phase_alloc_usd
+                max_trade_sol = self.capital_brain.usd_to_sol(max_trade_usd)
 
                 # Create forced sell intent
                 intent = TradeIntent(
                     wallet_address=wallet_addr,
                     token_mint=self.token_mint,
                     side="sell",
-                    amount_sol=min(pos["quantity"], self.trading_config.max_trade_size_sol),
+                    amount_sol=min(pos["quantity"], max_trade_sol),
                     expected_price=current_price,
-                    strategy_reason=f"STOP_LOSS: {loss_pct:.1f}% loss (threshold: {self.trading_config.stop_loss_percent}%)",
+                    max_slippage_percent=self.phase_config.max_slippage_pct,
+                    strategy_reason=f"STOP_LOSS: {loss_pct:.1f}% loss (threshold: {stop_loss_pct}%)",
                 )
 
                 # Stop loss still goes through risk checks (but most will pass for sells)
@@ -311,86 +364,82 @@ class MarketMakerV2:
 
     # ── Signal to Intent Conversion ─────────────────────────────────
 
-    def _signal_to_intent(self, analysis, price: float) -> Optional[TradeIntent]:
+    async def _signal_to_intent(self, analysis, price: float) -> Optional[TradeIntent]:
         """
-        Convert a Wyckoff signal into a TradeIntent.
-        This is the core automated strategy:
-        - BUY when price is low (Accumulation) → sell SOL, buy token
-        - SELL when demand is high (Distribution) → sell token, get SOL
+        Convert a Wyckoff signal into a TradeIntent with dynamic sizing.
+
+        The bonding curve phase controls:
+        - Whether buy/sell signals are allowed (force_buy_mode blocks sells)
+        - Trade size as percentage of phase capital allocation
+        - Slippage tolerance
+
+        Wyckoff signals control:
+        - Whether to trade at all (signal + confidence)
+        - Trade direction (buy vs sell)
+        - Signal strength multiplier (STRONG signals get larger trades)
         """
         # Only act on signals with sufficient confidence
         if analysis.confidence < self.trading_config.min_confidence:
             return None
 
+        # Phase-level signal filtering
+        if self.phase_config.force_buy_mode:
+            # In force_buy_mode, block all sell signals
+            if analysis.signal in (TradeSignal.SELL, TradeSignal.STRONG_SELL):
+                logger.debug(
+                    f"Phase '{self.phase_config.phase_name}' blocks sell signals (force_buy_mode)"
+                )
+                return None
+            # In force_buy_mode, convert HOLD to BUY if confidence is high enough
+            if analysis.signal == TradeSignal.HOLD:
+                return None
+
+        # Skip HOLD signals
+        if analysis.signal == TradeSignal.HOLD:
+            return None
+
+        # Calculate trade size dynamically from phase config
+        trade_sol = await self.trade_calculator.calculate(
+            signal=analysis.signal,
+            phase_config=self.phase_config,
+        )
+
+        if trade_sol <= 0:
+            return None  # Unaffordable or zero size
+
         # Select wallet for this trade
         wallet = self.wallet_orchestrator.get_wallet(
             strategy=SelectionStrategy.HEALTH_BASED,
-            min_balance=self.trading_config.min_trade_size_sol,
+            min_balance=trade_sol if analysis.signal in (TradeSignal.BUY, TradeSignal.STRONG_BUY) else 0.01,
         )
         if not wallet:
             logger.warning("No wallet available for trade")
             return None
 
-        # Calculate trade size based on signal strength
-        base_size = self.trading_config.base_trade_size_sol
-        strong_size = base_size * self.trading_config.strong_signal_multiplier
+        # Determine side
+        if analysis.signal in (TradeSignal.BUY, TradeSignal.STRONG_BUY):
+            side = "buy"
+        else:
+            side = "sell"
 
-        # Clamp to configured limits
-        def clamp_size(size: float) -> float:
-            return max(
-                self.trading_config.min_trade_size_sol,
-                min(size, self.trading_config.max_trade_size_sol),
-            )
+        trade_usd = self.capital_brain.sol_to_usd(trade_sol)
+        logger.info(
+            f"Trade intent: {side} {trade_sol:.4f} SOL (${trade_usd:.2f}) "
+            f"[{self.phase_config.phase_name}, {analysis.signal.value}]"
+        )
 
-        if analysis.signal == TradeSignal.BUY:
-            # Accumulation phase — buy token at support (good value)
-            return TradeIntent(
-                wallet_address=wallet.address,
-                token_mint=self.token_mint,
-                side="buy",
-                amount_sol=clamp_size(base_size),
-                expected_price=price,
-                max_slippage_percent=self.trading_config.max_slippage_percent,
-                strategy_reason=analysis.reason,
-            )
-
-        elif analysis.signal == TradeSignal.STRONG_BUY:
-            # Strong accumulation signal — larger buy
-            return TradeIntent(
-                wallet_address=wallet.address,
-                token_mint=self.token_mint,
-                side="buy",
-                amount_sol=clamp_size(strong_size),
-                expected_price=price,
-                max_slippage_percent=self.trading_config.max_slippage_percent,
-                strategy_reason=analysis.reason,
-            )
-
-        elif analysis.signal == TradeSignal.SELL:
-            # Distribution phase — sell token into demand
-            return TradeIntent(
-                wallet_address=wallet.address,
-                token_mint=self.token_mint,
-                side="sell",
-                amount_sol=clamp_size(base_size),
-                expected_price=price,
-                max_slippage_percent=self.trading_config.max_slippage_percent,
-                strategy_reason=analysis.reason,
-            )
-
-        elif analysis.signal == TradeSignal.STRONG_SELL:
-            # Markdown phase — exit positions quickly
-            return TradeIntent(
-                wallet_address=wallet.address,
-                token_mint=self.token_mint,
-                side="sell",
-                amount_sol=clamp_size(strong_size),
-                expected_price=price,
-                max_slippage_percent=self.trading_config.max_slippage_percent,
-                strategy_reason=analysis.reason,
-            )
-
-        return None
+        return TradeIntent(
+            wallet_address=wallet.address,
+            token_mint=self.token_mint,
+            side=side,
+            amount_sol=trade_sol,
+            expected_price=price,
+            max_slippage_percent=self.phase_config.max_slippage_pct,
+            strategy_reason=(
+                f"{self.phase_config.phase_name} | {analysis.reason} | "
+                f"${trade_usd:.2f} ({self.phase_config.base_trade_size_pct}% of phase)"
+            ),
+        )
 
     # ── Trade Execution (with real signing) ─────────────────────────
 
@@ -583,12 +632,29 @@ class MarketMakerV2:
                     side="sell",
                     amount_sol=step.amount,
                     expected_price=price,
+                    max_slippage_percent=self.phase_config.max_slippage_pct,
                     strategy_reason=f"profit_taking: {step.reason}",
                 )
 
                 decision = self.risk_manager.evaluate_trade(intent)
                 if decision.action == RiskAction.APPROVED:
                     await self._execute_trade(intent, price)
+
+    # ── Capital Snapshots ───────────────────────────────────────────
+
+    def _record_capital_snapshot(self):
+        """Record current capital state to database."""
+        try:
+            record_capital_snapshot(
+                total_budget_usd=self.capital_brain.total_budget_usd,
+                deployed_capital_usd=self.capital_brain.deployed_capital_usd,
+                available_capital_usd=self.capital_brain.available_capital_usd,
+                sol_usd_price=self.capital_brain.sol_price_usd,
+                bonding_curve_phase=self.current_phase.value,
+                capital_utilization_pct=self.capital_brain.capital_utilization_pct,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to record capital snapshot: {e}")
 
     # ── Status & Config ─────────────────────────────────────────────
 
@@ -599,7 +665,7 @@ class MarketMakerV2:
             "cycle_count": self._cycle_count,
             "cycle_interval_s": self._cycle_interval_s,
             "last_price": self._last_price,
-            "current_phase": self.wyckoff.get_current_phase().value,
+            "current_wyckoff_phase": self.wyckoff.get_current_phase().value,
             "stats": self._stats,
             "risk": self.risk_manager.get_status(),
             "wallet_pool": self.wallet_orchestrator.get_pool_status(),
@@ -607,11 +673,16 @@ class MarketMakerV2:
             "order_fill_rate": self.order_manager.get_fill_rate(),
             "active_orders": self.order_manager.get_active_orders(),
             "recent_orders": self.order_manager.get_completed_orders(10),
+            # Capital Brain status
+            "capital": self.capital_brain.get_status(),
+            # Bonding curve phase info
+            "bonding_phase": {
+                "current": self.current_phase.value,
+                "config": self.phase_config.to_dict(),
+                "effective_sizes": self.trade_calculator.get_effective_sizes(self.phase_config),
+            },
             "trading_config": {
-                "base_trade_size_sol": self.trading_config.base_trade_size_sol,
-                "stop_loss_percent": self.trading_config.stop_loss_percent,
                 "min_confidence": self.trading_config.min_confidence,
-                "max_slippage_percent": self.trading_config.max_slippage_percent,
             },
         }
 
